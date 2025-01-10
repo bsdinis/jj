@@ -11,7 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
+
+use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,6 +25,16 @@ use thiserror::Error;
 
 use crate::git::RefSpec;
 use crate::git::RefToPush;
+
+/// Error splitting a directory into workspace/git dir
+#[derive(Error, Debug)]
+pub enum SplitGitDirError {
+    #[error("The Git dir should be an absolute path")]
+    RelativePath,
+
+    #[error("The last directory is neither 'git' or '.git' dir")]
+    MissingGitDir,
+}
 
 /// Error originating by a Git subprocess
 #[derive(Error, Debug)]
@@ -46,24 +57,46 @@ pub enum GitSubprocessError {
     Wait(std::io::Error),
     #[error("Git process failed: {0}")]
     External(String),
+    #[error("Git dir `{path}` is malformed: could not extract workspace root from it")]
+    MalformedGitDir {
+        path: PathBuf,
+        #[source]
+        error: SplitGitDirError,
+    },
 }
 
 /// Context for creating Git subprocesses
 pub(crate) struct GitSubprocessContext<'a> {
     git_dir: PathBuf,
+    workspace_root: PathBuf,
     git_executable_path: &'a Path,
 }
 
 impl<'a> GitSubprocessContext<'a> {
-    pub(crate) fn new(git_dir: impl Into<PathBuf>, git_executable_path: &'a Path) -> Self {
+    pub(crate) fn new(
+        git_dir: impl Into<PathBuf>,
+        workspace_root: impl Into<PathBuf>,
+        git_executable_path: &'a Path,
+    ) -> Self {
         GitSubprocessContext {
             git_dir: git_dir.into(),
+            workspace_root: workspace_root.into(),
             git_executable_path,
         }
     }
 
-    pub(crate) fn from_git2(git_repo: &git2::Repository, git_executable_path: &'a Path) -> Self {
-        Self::new(git_repo.path(), git_executable_path)
+    pub(crate) fn from_git2(
+        git_repo: &git2::Repository,
+        git_executable_path: &'a Path,
+    ) -> Result<Self, GitSubprocessError> {
+        let (workspace_root, git_dir) = split_git_dir_path(git_repo.path()).map_err(|error| {
+            GitSubprocessError::MalformedGitDir {
+                path: git_repo.path().to_owned(),
+                error,
+            }
+        })?;
+
+        Ok(Self::new(git_dir, workspace_root, git_executable_path))
     }
 
     /// Create the Git command
@@ -74,6 +107,7 @@ impl<'a> GitSubprocessContext<'a> {
         // root to Command::current_dir and then pass a relative path to the git
         // dir
         git_cmd
+            .current_dir(&self.workspace_root)
             .arg("--bare")
             .arg("--git-dir")
             .arg(&self.git_dir)
@@ -477,8 +511,62 @@ fn parse_git_push_output(output: Output) -> Result<(Vec<String>, Vec<String>), G
     }
 }
 
+/// Split an absolute path to a git dir into both the workspace root
+/// and the relative path, from that workspace root, into the git dir
+///
+/// e.g.:
+///  - for a colocated repo: f("/path/to/dir/.git") -> ("/path/to/dir", ".git")
+///  - for a non-colocated repo: f("/path/to/dir/.jj/repo/store/git") ->
+///    ("/path/to/dir", "./repo/store/git")
+fn split_git_dir_path(absolute_git_path: &Path) -> Result<(PathBuf, PathBuf), SplitGitDirError> {
+    if absolute_git_path.is_relative() {
+        return Err(SplitGitDirError::RelativePath);
+    }
+    if absolute_git_path.file_name() == Some(OsStr::new(".git")) {
+        let workspace_root = absolute_git_path
+            .parent()
+            .map(|x| x.to_owned())
+            // all non-relative dirs, except the root, have a parent
+            .ok_or(SplitGitDirError::RelativePath)?;
+        let git_dir = Path::new(".git").to_owned();
+
+        Ok((workspace_root, git_dir))
+    } else if absolute_git_path.file_name() == Some(OsStr::new("git")) {
+        let workspace_root = absolute_git_path
+            .ancestors()
+            .find(|p| p.file_name() == Some(OsStr::new(".jj")))
+            .and_then(|p| p.parent())
+            .map(|x| x.to_owned())
+            // all non-relative dirs, except the root, have a parent
+            .ok_or(SplitGitDirError::RelativePath)?;
+
+        // we must use this particularly weird structure to support nested ".jj"
+        // directories by walking the components in reverse, from the git dir
+        // provided, we make sure that the ".jj" dir here is the same as the one
+        // that is just left out from the workspace root
+        //
+        // note that the code above early returns if the ".jj" dir is not found, so we
+        // do not need to check it here
+        let mut git_dir_components = Vec::new();
+        for component in absolute_git_path.components().rev() {
+            git_dir_components.push(component.as_os_str());
+            if component.as_os_str() == OsStr::new(".jj") {
+                break;
+            }
+        }
+        let git_dir = git_dir_components.into_iter().rev().collect();
+        Ok((workspace_root, git_dir))
+    } else {
+        Err(SplitGitDirError::MissingGitDir)
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use std::path::Component;
+
+    use assert_matches::assert_matches;
+
     use super::*;
 
     const SAMPLE_NO_SUCH_REPOSITORY_ERROR: &[u8] =
@@ -585,5 +673,63 @@ Done";
             ]
         );
         assert!(parse_ref_pushes(SAMPLE_OK_STDERR).is_err());
+    }
+
+    #[test]
+    fn test_split_git_dir() {
+        #[cfg(not(target_os = "windows"))]
+        fn absolute_path(components: &[&str]) -> PathBuf {
+            std::iter::once(Component::RootDir)
+                .chain(components.iter().map(OsStr::new).map(Component::Normal))
+                .collect()
+        }
+        #[cfg(target_os = "windows")]
+        fn absolute_path(components: &[&str]) -> PathBuf {
+            let windows_root = OsStr::new("C:\\");
+            std::iter::once(windows_root)
+                .chain(components.iter().map(OsStr::new))
+                .collect()
+        }
+
+        fn relative_path(components: &[&str]) -> PathBuf {
+            components.iter().map(OsStr::new).collect()
+        }
+
+        assert_matches!(
+            split_git_dir_path(&relative_path(&["relative_path"])).unwrap_err(),
+            SplitGitDirError::RelativePath
+        );
+        for failed_path in [
+            absolute_path(&["git", "dir", "is", "not", "terminal"]),
+            absolute_path(&["no", "git_dir", "in", "the", "path"]),
+            absolute_path(&["another", "non", "terminal", ".git", "dir"]),
+        ] {
+            assert_matches!(
+                split_git_dir_path(&failed_path).unwrap_err(),
+                SplitGitDirError::MissingGitDir
+            );
+        }
+
+        let (work, git) =
+            split_git_dir_path(&absolute_path(&["good", "path", "to", ".git"])).unwrap();
+        assert_eq!(work, absolute_path(&["good", "path", "to"]));
+        assert_eq!(git, relative_path(&[".git"]));
+
+        let (work, git) = split_git_dir_path(&absolute_path(&[
+            "good", "path", "to", ".jj", "repo", "store", "git",
+        ]))
+        .unwrap();
+        assert_eq!(work, absolute_path(&["good", "path", "to"]));
+        assert_eq!(git, relative_path(&[".jj", "repo", "store", "git"]));
+
+        let (work, git) = split_git_dir_path(&absolute_path(&[
+            "nested", ".jj", "paths", "are", "very", "annoying", ".jj", "repo", "store", "git",
+        ]))
+        .unwrap();
+        assert_eq!(
+            work,
+            absolute_path(&["nested", ".jj", "paths", "are", "very", "annoying",])
+        );
+        assert_eq!(git, relative_path(&[".jj", "repo", "store", "git"]));
     }
 }

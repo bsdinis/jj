@@ -1619,7 +1619,7 @@ impl<'a> GitFetch<'a> {
         }
 
         let git_ctx =
-            GitSubprocessContext::from_git2(self.git_repo, &self.git_settings.executable_path);
+            GitSubprocessContext::from_git2(self.git_repo, &self.git_settings.executable_path)?;
 
         let mut branches_to_prune = Vec::new();
         // git unfortunately errors out if one of the many refspecs is not found
@@ -2028,7 +2028,7 @@ fn subprocess_push_refs(
             GitPushError::InternalGitError(err)
         }
     })?;
-    let git_ctx = GitSubprocessContext::from_git2(git_repo, git_executable_path);
+    let git_ctx = GitSubprocessContext::from_git2(git_repo, git_executable_path)?;
 
     let mut remaining_remote_refs: HashSet<_> = qualified_remote_refs_expected_locations
         .keys()
