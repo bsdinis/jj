@@ -2866,6 +2866,92 @@ fn test_fetch_no_such_remote() {
     assert!(matches!(result, Err(GitFetchError::NoSuchRemote(_))));
 }
 
+#[test]
+fn test_fetch_multiple_branches() {
+    let mut test_data = GitRepoData::create();
+    let initial_git_commit = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
+    let git_settings = GitSettings {
+        auto_local_bookmark: true,
+        ..Default::default()
+    };
+
+    let mut tx = test_data.repo.start_transaction();
+    git::fetch(
+        tx.repo_mut(),
+        &test_data.git_repo,
+        "origin",
+        &[
+            StringPattern::Exact("main".to_string()),
+            StringPattern::Exact("noexist1".to_string()),
+            StringPattern::Exact("noexist2".to_string()),
+        ],
+        git::RemoteCallbacks::default(),
+        &git_settings,
+        None,
+    )
+    .unwrap();
+    test_data.repo = tx.commit("test").unwrap();
+
+    test_data.origin_repo.set_head("refs/heads/main").unwrap();
+    let new_git_commit = empty_git_commit(
+        &test_data.origin_repo,
+        "refs/heads/main",
+        &[&initial_git_commit],
+    );
+    test_data
+        .origin_repo
+        .reference("refs/tags/v1.0", new_git_commit.id(), false, "")
+        .unwrap();
+
+    let mut tx = test_data.repo.start_transaction();
+    let stats = git::fetch(
+        tx.repo_mut(),
+        &test_data.git_repo,
+        "origin",
+        &[StringPattern::everything()],
+        git::RemoteCallbacks::default(),
+        &git_settings,
+        None,
+    )
+    .unwrap();
+    // The default bookmark is "main"
+    assert_eq!(stats.default_branch, Some("main".to_string()));
+    assert!(stats.import_stats.abandoned_commits.is_empty());
+    let repo = tx.commit("test").unwrap();
+    // The new commit is visible after we fetch again
+    let view = repo.view();
+    assert!(view.heads().contains(&jj_id(&new_git_commit)));
+    let new_commit_target = RefTarget::normal(jj_id(&new_git_commit));
+    let new_commit_remote_ref = RemoteRef {
+        target: new_commit_target.clone(),
+        state: RemoteRefState::Tracking,
+    };
+    assert_eq!(
+        *view.git_refs(),
+        btreemap! {
+            "refs/remotes/origin/main".to_string() => new_commit_target.clone(),
+            "refs/tags/v1.0".to_string() => new_commit_target.clone(),
+        }
+    );
+    assert_eq!(
+        view.bookmarks().collect::<BTreeMap<_, _>>(),
+        btreemap! {
+            "main" => BookmarkTarget {
+                local_target: &new_commit_target,
+                remote_refs: vec![
+                    ("origin", &new_commit_remote_ref),
+                ],
+            },
+        }
+    );
+    assert_eq!(
+        *view.tags(),
+        btreemap! {
+            "v1.0".to_string() => new_commit_target.clone(),
+        }
+    );
+}
+
 struct PushTestSetup {
     source_repo_dir: PathBuf,
     jj_repo: Arc<ReadonlyRepo>,
