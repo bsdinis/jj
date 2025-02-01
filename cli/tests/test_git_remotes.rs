@@ -15,6 +15,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use testutils::git;
+
 use crate::common::TestEnvironment;
 
 #[test]
@@ -254,15 +256,14 @@ fn test_git_remote_named_git() {
 
     // Existing remote named 'git' shouldn't block the repo initialization.
     let repo_path = test_env.env_root().join("repo");
-    let git_repo = git2::Repository::init(&repo_path).unwrap();
-    git_repo
-        .remote("git", "http://example.com/repo/repo")
-        .unwrap();
+    let git_repo = git::init(&repo_path);
+    let remote = git_repo.remote_at("http://example.com/repo/repo").unwrap();
+    git::add_remote(&git_repo, "git", remote);
     test_env
-        .run_jj_in(&repo_path, ["git", "init", "--git-repo=."])
+        .run_jj_in(&repo_path, &["git", "init", "--git-repo=."])
         .success();
     test_env
-        .run_jj_in(&repo_path, ["bookmark", "create", "-r@", "main"])
+        .run_jj_in(&repo_path, &["bookmark", "create", "-r@", "main"])
         .success();
 
     // The remote can be renamed.
@@ -293,9 +294,11 @@ fn test_git_remote_named_git() {
 
     // Reinitialize the repo with remote named 'git'.
     fs::remove_dir_all(repo_path.join(".jj")).unwrap();
-    git_repo.remote_rename("bar", "git").unwrap();
+    // need to reload the config in the repo
+    let git_repo = git::open(&repo_path);
+    git::rename_remote(&git_repo, "bar", "git");
     test_env
-        .run_jj_in(&repo_path, ["git", "init", "--git-repo=."])
+        .run_jj_in(&repo_path, &["git", "init", "--git-repo=."])
         .success();
 
     // The remote can also be removed.
@@ -320,10 +323,9 @@ fn test_git_remote_with_slashes() {
 
     // Existing remote with slashes shouldn't block the repo initialization.
     let repo_path = test_env.env_root().join("repo");
-    let git_repo = git2::Repository::init(&repo_path).unwrap();
-    git_repo
-        .remote("slash/origin", "http://example.com/repo/repo")
-        .unwrap();
+    let git_repo = git::init(&repo_path);
+    let remote = git_repo.remote_at("http://example.com/repo/repo").unwrap();
+    git::add_remote(&git_repo, "slash/origin", remote);
     test_env
         .run_jj_in(&repo_path, ["git", "init", "--git-repo=."])
         .success();
@@ -380,7 +382,8 @@ fn test_git_remote_with_slashes() {
 
     // Reinitialize the repo with remote with slashes
     fs::remove_dir_all(repo_path.join(".jj")).unwrap();
-    git_repo.remote_rename("origin", "slash/origin").unwrap();
+    let git_repo = git::open(&repo_path);
+    git::rename_remote(&git_repo, "origin", "slash/origin");
     test_env
         .run_jj_in(&repo_path, ["git", "init", "--git-repo=."])
         .success();

@@ -352,3 +352,42 @@ impl<'a> IndexManager<'a> {
             .unwrap();
     }
 }
+
+pub fn add_remote(repo: &gix::Repository, remote_name: &str, mut remote: gix::Remote<'_>) {
+    let mut config = repo.config_snapshot().clone();
+    remote.save_as_to(remote_name, &mut config).unwrap();
+    let mut config_file = std::fs::File::create(config.meta().path.as_ref().unwrap()).unwrap();
+    config
+        .write_to_filter(&mut config_file, |section| section.meta() == config.meta())
+        .unwrap();
+}
+
+pub fn rename_remote(repo: &gix::Repository, original: &str, new: &str) {
+    let mut remote = repo.find_remote(original).unwrap();
+    remote
+        .replace_refspecs(
+            [format!("+refs/heads/*:refs/remotes/{new}/*").as_bytes()],
+            gix::remote::Direction::Fetch,
+        )
+        .unwrap();
+    let mut config = repo.config_snapshot().clone();
+    remote.save_as_to(new, &mut config).unwrap();
+
+    let ids: Vec<_> = config
+        .sections_and_ids_by_name("remote")
+        .unwrap()
+        .filter(|(section, _id)| {
+            section.header().subsection_name() == Some(bstr::BStr::new(original))
+        })
+        .map(|(_section, id)| id)
+        .collect();
+
+    for id in ids {
+        config.remove_section_by_id(id);
+    }
+
+    let mut config_file = std::fs::File::create(config.meta().path.as_ref().unwrap()).unwrap();
+    config
+        .write_to_filter(&mut config_file, |section| section.meta() == config.meta())
+        .unwrap();
+}
