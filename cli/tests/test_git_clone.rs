@@ -18,37 +18,11 @@ use std::path::PathBuf;
 
 use indoc::formatdoc;
 use test_case::test_case;
+use testutils::git;
 
 use crate::common::to_toml_value;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
-
-fn set_up_non_empty_git_repo(git_repo: &git2::Repository) {
-    set_up_git_repo_with_file(git_repo, "file");
-}
-
-fn set_up_git_repo_with_file(git_repo: &git2::Repository, filename: &str) {
-    let signature =
-        git2::Signature::new("Some One", "some.one@example.com", &git2::Time::new(0, 0)).unwrap();
-    let mut tree_builder = git_repo.treebuilder(None).unwrap();
-    let file_oid = git_repo.blob(b"content").unwrap();
-    tree_builder
-        .insert(filename, file_oid, git2::FileMode::Blob.into())
-        .unwrap();
-    let tree_oid = tree_builder.write().unwrap();
-    let tree = git_repo.find_tree(tree_oid).unwrap();
-    git_repo
-        .commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "message",
-            &tree,
-            &[],
-        )
-        .unwrap();
-    git_repo.set_head("refs/heads/main").unwrap();
-}
 
 #[test_case(false; "use git2 for remote calls")]
 #[test_case(true; "spawn a git subprocess for remote calls")]
@@ -59,7 +33,7 @@ fn test_git_clone(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
+    let git_repo = git::init(git_repo_path);
 
     // Clone an empty repo
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "empty"]);
@@ -72,7 +46,18 @@ fn test_git_clone(subprocess: bool) {
     "#);
     }
 
-    set_up_non_empty_git_repo(&git_repo);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     // Clone with relative source path
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "clone"]);
@@ -82,8 +67,8 @@ fn test_git_clone(subprocess: bool) {
     Fetching into new repo in "$TEST_ENV/clone"
     bookmark: main@origin [new] tracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: uuqppmxq 1f0b881a (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 main | message
+    Working copy now at: uuqppmxq f78d2645 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -202,8 +187,8 @@ fn test_git_clone(subprocess: bool) {
     Fetching into new repo in "$TEST_ENV/nested/path/to/repo"
     bookmark: main@origin [new] tracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: uuzqqzqu df8acbac (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 main | message
+    Working copy now at: uuzqqzqu cf5d593e (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -253,7 +238,7 @@ fn test_git_clone_colocate(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
+    let git_repo = git::init(git_repo_path);
 
     // Clone an empty repo
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "empty", "--colocate"]);
@@ -277,7 +262,18 @@ fn test_git_clone_colocate(subprocess: bool) {
         @"../../../.git");
     }
 
-    set_up_non_empty_git_repo(&git_repo);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     // Clone with relative source path
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "clone", "--colocate"]);
@@ -287,8 +283,8 @@ fn test_git_clone_colocate(subprocess: bool) {
     Fetching into new repo in "$TEST_ENV/clone"
     bookmark: main@origin [new] tracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: uuqppmxq 1f0b881a (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 main | message
+    Working copy now at: uuqppmxq f78d2645 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -296,46 +292,42 @@ fn test_git_clone_colocate(subprocess: bool) {
     assert!(test_env.env_root().join("clone").join("file").exists());
     assert!(test_env.env_root().join("clone").join(".git").exists());
 
-    eprintln!(
-        "{:?}",
-        git_repo.head().expect("Repo head should be set").name()
-    );
-
-    let jj_git_repo = git2::Repository::open(test_env.env_root().join("clone"))
-        .expect("Could not open clone repo");
+    let jj_git_repo = git::open(test_env.env_root().join("clone"));
     assert_eq!(
         jj_git_repo
-            .head()
+            .head_id()
             .expect("Clone Repo HEAD should be set.")
-            .symbolic_target(),
+            .detach(),
         git_repo
-            .head()
+            .head_id()
             .expect("Repo HEAD should be set.")
-            .symbolic_target()
+            .detach(),
     );
     // ".jj" directory should be ignored at Git side.
-    #[allow(clippy::format_collect)]
-    let git_statuses: String = jj_git_repo
-        .statuses(None)
-        .unwrap()
-        .iter()
-        .map(|entry| format!("{:?} {}\n", entry.status(), entry.path().unwrap()))
-        .collect();
-    insta::allow_duplicates! {
-    insta::assert_snapshot!(git_statuses, @r###"
-    Status(IGNORED) .jj/.gitignore
-    Status(IGNORED) .jj/repo/
-    Status(IGNORED) .jj/working_copy/
-    "###);
-    }
+    let git_statuses = git::status(&jj_git_repo);
+    let expected = vec![
+        git::GitStatus::new(
+            ".jj/.gitignore",
+            git::GitStatusInfo::Worktree(git::WorktreeStatus::Ignored),
+        ),
+        git::GitStatus::new(
+            ".jj/repo",
+            git::GitStatusInfo::Worktree(git::WorktreeStatus::Ignored),
+        ),
+        git::GitStatus::new(
+            ".jj/working_copy",
+            git::GitStatusInfo::Worktree(git::WorktreeStatus::Ignored),
+        ),
+    ];
+    assert_eq!(git_statuses, expected);
 
     // The old default bookmark "master" shouldn't exist.
     insta::allow_duplicates! {
     insta::assert_snapshot!(
         get_bookmark_output(&test_env, &test_env.env_root().join("clone")), @r"
-    main: mzyxwzks 9f01a0e0 message
-      @git: mzyxwzks 9f01a0e0 message
-      @origin: mzyxwzks 9f01a0e0 message
+    main: qomsplrm ebeb70d8 message
+      @git: qomsplrm ebeb70d8 message
+      @origin: qomsplrm ebeb70d8 message
     [EOF]
     ");
     }
@@ -463,8 +455,8 @@ fn test_git_clone_colocate(subprocess: bool) {
     Fetching into new repo in "$TEST_ENV/nested/path/to/repo"
     bookmark: main@origin [new] tracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: vzqnnsmr 9407107f (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 main | message
+    Working copy now at: vzqnnsmr 589d0921 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -479,16 +471,28 @@ fn test_git_clone_remote_default_bookmark(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
-    // Create non-default bookmark in remote
-    let oid = git_repo
-        .find_reference("refs/heads/main")
-        .unwrap()
-        .target()
-        .unwrap();
+    let git_repo = git::init(git_repo_path.clone());
+
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+
+    git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/main");
     git_repo
-        .reference("refs/heads/feature1", oid, false, "")
+        .reference(
+            "refs/heads/feature1",
+            commit_id,
+            gix::refs::transaction::PreviousValue::MustNotExist,
+            "",
+        )
         .unwrap();
 
     // All fetched bookmarks will be imported if auto-local-bookmark is on
@@ -501,19 +505,19 @@ fn test_git_clone_remote_default_bookmark(subprocess: bool) {
     bookmark: feature1@origin [new] tracked
     bookmark: main@origin     [new] tracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: sqpuoqvx cad212e1 (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 feature1 main | message
+    Working copy now at: sqpuoqvx 2ca1c979 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 feature1 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
     }
     insta::allow_duplicates! {
     insta::assert_snapshot!(
-        get_bookmark_output(&test_env, &test_env.env_root().join("clone1")), @r"
-    feature1: mzyxwzks 9f01a0e0 message
-      @origin: mzyxwzks 9f01a0e0 message
-    main: mzyxwzks 9f01a0e0 message
-      @origin: mzyxwzks 9f01a0e0 message
+         get_bookmark_output(&test_env, &test_env.env_root().join("clone1")), @r"
+    feature1: qomsplrm ebeb70d8 message
+      @origin: qomsplrm ebeb70d8 message
+    main: qomsplrm ebeb70d8 message
+      @origin: qomsplrm ebeb70d8 message
     [EOF]
     ");
     }
@@ -540,24 +544,24 @@ fn test_git_clone_remote_default_bookmark(subprocess: bool) {
     bookmark: feature1@origin [new] untracked
     bookmark: main@origin     [new] untracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: rzvqmyuk cc8a5041 (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 feature1@origin main | message
+    Working copy now at: rzvqmyuk 018092c2 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 feature1@origin main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
     }
     insta::allow_duplicates! {
     insta::assert_snapshot!(
-        get_bookmark_output(&test_env, &test_env.env_root().join("clone2")), @r"
-    feature1@origin: mzyxwzks 9f01a0e0 message
-    main: mzyxwzks 9f01a0e0 message
-      @origin: mzyxwzks 9f01a0e0 message
+         get_bookmark_output(&test_env, &test_env.env_root().join("clone2")), @r"
+    feature1@origin: qomsplrm ebeb70d8 message
+    main: qomsplrm ebeb70d8 message
+      @origin: qomsplrm ebeb70d8 message
     [EOF]
     ");
     }
 
     // Change the default bookmark in remote
-    git_repo.set_head("refs/heads/feature1").unwrap();
+    git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/feature1");
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "clone3"]);
     insta::allow_duplicates! {
     insta::assert_snapshot!(output, @r#"
@@ -566,8 +570,8 @@ fn test_git_clone_remote_default_bookmark(subprocess: bool) {
     bookmark: feature1@origin [new] untracked
     bookmark: main@origin     [new] untracked
     Setting the revset alias `trunk()` to `feature1@origin`
-    Working copy now at: nppvrztz b8a8a17b (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 feature1 main@origin | message
+    Working copy now at: nppvrztz 5fd587f4 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 feature1 main@origin | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -575,9 +579,9 @@ fn test_git_clone_remote_default_bookmark(subprocess: bool) {
     insta::allow_duplicates! {
     insta::assert_snapshot!(
         get_bookmark_output(&test_env, &test_env.env_root().join("clone3")), @r"
-    feature1: mzyxwzks 9f01a0e0 message
-      @origin: mzyxwzks 9f01a0e0 message
-    main@origin: mzyxwzks 9f01a0e0 message
+    feature1: qomsplrm ebeb70d8 message
+      @origin: qomsplrm ebeb70d8 message
+    main@origin: qomsplrm ebeb70d8 message
     [EOF]
     ");
     }
@@ -606,14 +610,17 @@ fn test_git_clone_remote_default_bookmark_with_escape(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
-    // Rename the main branch to something that needs to be escaped
-    git_repo
-        .find_reference("refs/heads/main")
-        .unwrap()
-        .rename("refs/heads/\"", false, "")
-        .unwrap();
+    let git_repo = git::init(git_repo_path);
+    // Create a branch to something that needs to be escaped
+    let commit_result = git::add_commit(
+        &git_repo,
+        "refs/heads/\"",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_result.commit_id);
 
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "clone"]);
     insta::allow_duplicates! {
@@ -622,8 +629,8 @@ fn test_git_clone_remote_default_bookmark_with_escape(subprocess: bool) {
     Fetching into new repo in "$TEST_ENV/clone"
     bookmark: "\""@origin [new] untracked
     Setting the revset alias `trunk()` to `"\""@origin`
-    Working copy now at: sqpuoqvx cad212e1 (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 " | message
+    Working copy now at: sqpuoqvx 2ca1c979 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 " | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -650,8 +657,19 @@ fn test_git_clone_ignore_working_copy(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     // Should not update working-copy files
     let output = test_env.run_jj_in(
@@ -673,8 +691,8 @@ fn test_git_clone_ignore_working_copy(subprocess: bool) {
     insta::allow_duplicates! {
     insta::assert_snapshot!(output, @r"
     The working copy has no changes.
-    Working copy : sqpuoqvx cad212e1 (empty) (no description set)
-    Parent commit: mzyxwzks 9f01a0e0 main | message
+    Working copy : sqpuoqvx 2ca1c979 (empty) (no description set)
+    Parent commit: qomsplrm ebeb70d8 main | message
     [EOF]
     ");
     }
@@ -701,8 +719,19 @@ fn test_git_clone_at_operation(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     let output = test_env.run_jj_in(".", ["git", "clone", "--at-op=@-", "source", "clone"]);
     insta::allow_duplicates! {
@@ -724,8 +753,19 @@ fn test_git_clone_with_remote_name(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     // Clone with relative source path and a non-default remote name
     let output = test_env.run_jj_in(
@@ -738,8 +778,8 @@ fn test_git_clone_with_remote_name(subprocess: bool) {
     Fetching into new repo in "$TEST_ENV/clone"
     bookmark: main@upstream [new] tracked
     Setting the revset alias `trunk()` to `main@upstream`
-    Working copy now at: sqpuoqvx cad212e1 (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 main | message
+    Working copy now at: sqpuoqvx 2ca1c979 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -754,7 +794,7 @@ fn test_git_clone_with_remote_named_git(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    git2::Repository::init(git_repo_path).unwrap();
+    git::init(git_repo_path);
 
     let output = test_env.run_jj_in(".", ["git", "clone", "--remote=git", "source", "dest"]);
     insta::allow_duplicates! {
@@ -775,7 +815,7 @@ fn test_git_clone_with_remote_with_slashes(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    git2::Repository::init(git_repo_path).unwrap();
+    git::init(git_repo_path);
 
     let output = test_env.run_jj_in(
         ".",
@@ -799,8 +839,19 @@ fn test_git_clone_trunk_deleted(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
     let clone_path = test_env.env_root().join("clone");
 
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "clone"]);
@@ -810,8 +861,8 @@ fn test_git_clone_trunk_deleted(subprocess: bool) {
     Fetching into new repo in "$TEST_ENV/clone"
     bookmark: main@origin [new] untracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: sqpuoqvx cad212e1 (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 main | message
+    Working copy now at: sqpuoqvx 2ca1c979 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -834,18 +885,18 @@ fn test_git_clone_trunk_deleted(subprocess: bool) {
 
     let output = test_env.run_jj_in(&clone_path, ["log"]);
     insta::allow_duplicates! {
-    insta::assert_snapshot!(output, @r"
-    @  sqpuoqvx test.user@example.com 2001-02-03 08:05:07 cad212e1
-    │  (empty) (no description set)
-    ○  mzyxwzks some.one@example.com 1970-01-01 11:00:00 9f01a0e0
-    │  message
-    ◆  zzzzzzzz root() 00000000
-    [EOF]
-    ------- stderr -------
-    Warning: Failed to resolve `revset-aliases.trunk()`: Revision `main@origin` doesn't exist
-    Hint: Use `jj config edit --repo` to adjust the `trunk()` alias.
-    [EOF]
-    ");
+     insta::assert_snapshot!(output, @r"
+     @  sqpuoqvx test.user@example.com 2001-02-03 08:05:07 2ca1c979
+     │  (empty) (no description set)
+     ○  qomsplrm someone@example.org 1970-01-01 11:00:00 ebeb70d8
+     │  message
+     ◆  zzzzzzzz root() 00000000
+     [EOF]
+     ------- stderr -------
+     Warning: Failed to resolve `revset-aliases.trunk()`: Revision `main@origin` doesn't exist
+     Hint: Use `jj config edit --repo` to adjust the `trunk()` alias.
+     [EOF]
+     ");
     }
 }
 
@@ -855,8 +906,19 @@ fn test_git_clone_conditional_config() {
     let source_repo_path = test_env.env_root().join("source");
     let old_workspace_root = test_env.env_root().join("old");
     let new_workspace_root = test_env.env_root().join("new");
-    let source_git_repo = git2::Repository::init(source_repo_path).unwrap();
-    set_up_non_empty_git_repo(&source_git_repo);
+    let source_git_repo = git::init(source_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &source_git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&source_git_repo, commit_id);
 
     let run_jj_in = |current_dir: &Path, args: &[&str]| {
         test_env.run_jj_with(|cmd| {
@@ -910,8 +972,8 @@ fn test_git_clone_conditional_config() {
     Fetching into new repo in "$TEST_ENV/new"
     bookmark: main@origin [new] untracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: zxsnswpr 5695b5e5 (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 main | message
+    Working copy now at: zxsnswpr 9ffb42e2 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
@@ -920,7 +982,7 @@ fn test_git_clone_conditional_config() {
     insta::assert_snapshot!(output, @r"
     @  new-repo@example.org
     ○  new-repo@example.org
-    ◆  some.one@example.com message
+    ◆  someone@example.org message
     │
     ~
     [EOF]
@@ -942,8 +1004,19 @@ fn test_git_clone_with_depth_git2() {
     test_env.add_config("git.auto-local-bookmark = true");
     test_env.add_config("git.subprocess = false");
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     // git does support shallow clones on the local transport, so it will work
     // (we cannot replicate git2's erroneous behaviour wrt git)
@@ -965,8 +1038,19 @@ fn test_git_clone_with_depth_subprocess() {
     test_env.add_config("git.auto-local-bookmark = true");
     let clone_path = test_env.env_root().join("clone");
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     // git does support shallow clones on the local transport, so it will work
     // (we cannot replicate git2's erroneous behaviour wrt git)
@@ -976,17 +1060,17 @@ fn test_git_clone_with_depth_subprocess() {
     Fetching into new repo in "$TEST_ENV/clone"
     bookmark: main@origin [new] tracked
     Setting the revset alias `trunk()` to `main@origin`
-    Working copy now at: sqpuoqvx cad212e1 (empty) (no description set)
-    Parent commit      : mzyxwzks 9f01a0e0 main | message
+    Working copy now at: sqpuoqvx 2ca1c979 (empty) (no description set)
+    Parent commit      : qomsplrm ebeb70d8 main | message
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
 
     let output = test_env.run_jj_in(&clone_path, ["log"]);
     insta::assert_snapshot!(output, @r"
-    @  sqpuoqvx test.user@example.com 2001-02-03 08:05:07 cad212e1
+    @  sqpuoqvx test.user@example.com 2001-02-03 08:05:07 2ca1c979
     │  (empty) (no description set)
-    ◆  mzyxwzks some.one@example.com 1970-01-01 11:00:00 main 9f01a0e0
+    ◆  qomsplrm someone@example.org 1970-01-01 11:00:00 main ebeb70d8
     │  message
     ~
     [EOF]
@@ -1001,8 +1085,19 @@ fn test_git_clone_invalid_immutable_heads(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     test_env.add_config("revset-aliases.'immutable_heads()' = 'unknown'");
     // Suppress lengthy warnings in commit summary template
@@ -1033,11 +1128,21 @@ fn test_git_clone_malformed(subprocess: bool) {
         test_env.add_config("git.subprocess = false");
     }
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
+    let git_repo = git::init(git_repo_path);
     let clone_path = test_env.env_root().join("clone");
-    // libgit2 doesn't allow to create a malformed repo containing ".git", etc.,
-    // but we can insert ".jj" entry.
-    set_up_git_repo_with_file(&git_repo, ".jj");
+    // we can insert ".jj" entry to create a malformed clone
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        ".jj",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     // TODO: Perhaps, this should be a user error, not an internal error.
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "clone"]);
@@ -1047,7 +1152,7 @@ fn test_git_clone_malformed(subprocess: bool) {
     Fetching into new repo in "$TEST_ENV/clone"
     bookmark: main@origin [new] untracked
     Setting the revset alias `trunk()` to `main@origin`
-    Internal error: Failed to check out commit 039a1eae03465fd3be0fbad87c9ca97303742677
+    Internal error: Failed to check out commit 0a09cb41583450703459a2310d63da61456364ce
     Caused by: Reserved path component .jj in $TEST_ENV/clone/.jj
     [EOF]
     [exit status: 255]
@@ -1057,27 +1162,27 @@ fn test_git_clone_malformed(subprocess: bool) {
     // The cloned workspace isn't usable.
     let output = test_env.run_jj_in(&clone_path, ["status"]);
     insta::allow_duplicates! {
-    insta::assert_snapshot!(output, @r"
-    ------- stderr -------
-    Error: The working copy is stale (not updated since operation 4a8ddda0ff63).
-    Hint: Run `jj workspace update-stale` to update it.
-    See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy for more information.
-    [EOF]
-    [exit status: 1]
-    ");
+     insta::assert_snapshot!(output, @r"
+     ------- stderr -------
+     Error: The working copy is stale (not updated since operation 57e024eb3edf).
+     Hint: Run `jj workspace update-stale` to update it.
+     See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy for more information.
+     [EOF]
+     [exit status: 1]
+     ");
     }
 
     // The error can be somehow recovered.
     // TODO: add an update-stale flag to reset the working-copy?
     let output = test_env.run_jj_in(&clone_path, ["workspace", "update-stale"]);
     insta::allow_duplicates! {
-    insta::assert_snapshot!(output, @r"
-    ------- stderr -------
-    Internal error: Failed to check out commit 039a1eae03465fd3be0fbad87c9ca97303742677
-    Caused by: Reserved path component .jj in $TEST_ENV/clone/.jj
-    [EOF]
-    [exit status: 255]
-    ");
+     insta::assert_snapshot!(output, @r"
+     ------- stderr -------
+     Internal error: Failed to check out commit 0a09cb41583450703459a2310d63da61456364ce
+     Caused by: Reserved path component .jj in $TEST_ENV/clone/.jj
+     [EOF]
+     [exit status: 255]
+     ");
     }
     let output = test_env.run_jj_in(&clone_path, ["new", "root()", "--ignore-working-copy"]);
     insta::allow_duplicates! {
@@ -1099,8 +1204,19 @@ fn test_git_clone_no_git_executable() {
     let test_env = TestEnvironment::default();
     test_env.add_config("git.executable-path = 'jj-test-missing-program'");
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "clone"]);
     insta::assert_snapshot!(output.strip_stderr_last_line(), @r#"
@@ -1121,8 +1237,19 @@ fn test_git_clone_no_git_executable_with_path() {
         to_toml_value(invalid_git_executable_path.to_str().unwrap())
     ));
     let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git2::Repository::init(git_repo_path).unwrap();
-    set_up_non_empty_git_repo(&git_repo);
+    let git_repo = git::init(git_repo_path);
+    let git::CommitResult {
+        commit_id,
+        tree_id: _,
+    } = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "file",
+        b"content",
+        "message",
+        &[],
+    );
+    git::set_head_to_id(&git_repo, commit_id);
 
     let output = test_env.run_jj_in(".", ["git", "clone", "source", "clone"]);
     insta::assert_snapshot!(output.strip_stderr_last_line(), @r#"

@@ -304,6 +304,13 @@ pub struct GitStatus {
     status: GitStatusInfo,
 }
 
+impl GitStatus {
+    pub fn new(path: impl Into<String>, status: GitStatusInfo) -> Self {
+        let path = path.into();
+        GitStatus { path, status }
+    }
+}
+
 impl From<gix::status::Item> for GitStatus {
     fn from(value: gix::status::Item) -> Self {
         let path = value.location().to_string();
