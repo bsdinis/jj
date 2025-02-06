@@ -149,6 +149,25 @@ pub fn write_commit(
     .detach()
 }
 
+pub fn merge_commits(
+    repo: &gix::Repository,
+    reference: &str,
+    base: gix::ObjectId,
+    target: gix::ObjectId,
+) {
+    let signature = signature();
+    let tree_id = gix::ObjectId::empty_tree(repo.object_hash());
+    repo.commit_as(
+        &signature,
+        &signature,
+        reference,
+        "merge",
+        tree_id,
+        [base, target],
+    )
+    .unwrap();
+}
+
 pub fn set_head_to_id(repo: &gix::Repository, target: gix::ObjectId) {
     repo.edit_reference(gix::refs::transaction::RefEdit {
         change: gix::refs::transaction::Change::Update {
