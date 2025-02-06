@@ -205,7 +205,8 @@ impl<'a> GitSubprocessContext<'a> {
     ) -> Result<(Vec<String>, Vec<String>), GitSubprocessError> {
         let mut command = self.create_command();
         command.stdout(Stdio::piped());
-        command.args(["push", "--porcelain"]);
+        // we use --no-verify to skip the pre-push hooks
+        command.args(["push", "--porcelain", "--no-verify"]);
         if callbacks.progress.is_some() {
             command.arg("--progress");
         }
