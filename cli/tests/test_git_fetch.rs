@@ -1928,3 +1928,220 @@ fn test_git_fetch_preserve_commits_across_repos(subprocess: bool) {
     ");
     }
 }
+
+#[cfg(unix)]
+#[test_case(false; "use git2 for remote calls")]
+#[test_case(true; "spawn a git subprocess for remote calls")]
+fn test_git_fetch_with_symlink(subprocess: bool) {
+    let test_env = TestEnvironment::default();
+    if !subprocess {
+        test_env.add_config("git.subprocess = false");
+    }
+    test_env.add_config("git.auto-local-bookmark = true");
+    test_env.add_config(r#"revset-aliases."immutable_heads()" = "none()""#);
+
+    let source_git_repo_path = test_env.env_root().join("source");
+    git2::Repository::init(source_git_repo_path.clone()).unwrap();
+
+    // Clone an empty repo.
+    let (stdout, stderr) = test_env.jj_cmd_ok(
+        test_env.env_root(),
+        &["git", "clone", "--colocate", "source", "original"],
+    );
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(stdout, @"");
+    }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(stderr, @r###"
+    Fetching into new repo in "$TEST_ENV/original"
+    Nothing changed.
+    "###);
+    }
+
+    let original_jj_repo_path = test_env.env_root().join("original");
+    let target_jj_repo_path = test_env.env_root().join("target");
+    std::fs::create_dir(&target_jj_repo_path).unwrap();
+    std::os::unix::fs::symlink(
+        original_jj_repo_path.join(".git"),
+        target_jj_repo_path.join(".git"),
+    )
+    .unwrap();
+    let (stdout, stderr) = test_env.jj_cmd_ok(&target_jj_repo_path, &["git", "init", "--colocate"]);
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(stdout, @"");
+    }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(stderr, @r#"Initialized repo in ".""#);
+    }
+
+    let source_log =
+        create_colocated_repo_and_bookmarks_from_trunk1(&test_env, &source_git_repo_path);
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(source_log, @r"
+       ===== Source git repo contents =====
+    @  57e3eea942e6 descr_for_b b
+    │ ○  fd8cf6959754 descr_for_a2 a2
+    ├─╯
+    │ ○  0294c5914999 descr_for_a1 a1
+    ├─╯
+    ○  8f6283d767a1 descr_for_trunk1 trunk1
+    ◆  000000000000
+    ");
+    }
+
+    // Nothing in our repo before the fetch
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(get_log_output(&test_env, &target_jj_repo_path), @r"
+    @  6acbecf3f4d4
+    ◆  000000000000
+    ");
+    }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(get_bookmark_output(&test_env, &target_jj_repo_path), @"");
+    }
+    let (stdout, stderr) = test_env.jj_cmd_ok(&target_jj_repo_path, &["git", "fetch"]);
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(stdout, @"");
+        }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(stderr, @r###"
+    bookmark: a1@origin     [new] tracked
+    bookmark: a2@origin     [new] tracked
+    bookmark: b@origin      [new] tracked
+    bookmark: trunk1@origin [new] tracked
+    "###);
+        }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(get_bookmark_output(&test_env, &target_jj_repo_path), @r"
+    a1: mvvuowxt 0294c591 descr_for_a1
+      @git: mvvuowxt 0294c591 descr_for_a1
+      @origin: mvvuowxt 0294c591 descr_for_a1
+    a2: uprmlzux fd8cf695 descr_for_a2
+      @git: uprmlzux fd8cf695 descr_for_a2
+      @origin: uprmlzux fd8cf695 descr_for_a2
+    b: ypospnrw 57e3eea9 descr_for_b
+      @git: ypospnrw 57e3eea9 descr_for_b
+      @origin: ypospnrw 57e3eea9 descr_for_b
+    trunk1: woovuqxq 8f6283d7 descr_for_trunk1
+      @git: woovuqxq 8f6283d7 descr_for_trunk1
+      @origin: woovuqxq 8f6283d7 descr_for_trunk1
+    ");
+        }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(get_log_output(&test_env, &target_jj_repo_path), @r"
+    @  6acbecf3f4d4
+    │ ○  57e3eea942e6 descr_for_b b
+    │ │ ○  fd8cf6959754 descr_for_a2 a2
+    │ ├─╯
+    │ │ ○  0294c5914999 descr_for_a1 a1
+    │ ├─╯
+    │ ○  8f6283d767a1 descr_for_trunk1 trunk1
+    ├─╯
+    ◆  000000000000
+    ");
+    }
+
+    // ==== Change both repos ====
+    // First, change the target repo:
+    let source_log = create_trunk2_and_rebase_bookmarks(&test_env, &source_git_repo_path);
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(source_log, @r"
+       ===== Source git repo contents =====
+    ○  67b44a6cad31 descr_for_b b
+    │ ○  528dd27d4bde descr_for_a2 a2
+    ├─╯
+    │ ○  518eec71b3bd descr_for_a1 a1
+    ├─╯
+    @  5e50a60c834f descr_for_trunk2 trunk2
+    ○  8f6283d767a1 descr_for_trunk1 trunk1
+    ◆  000000000000
+    ");
+    }
+    // Change a bookmark in the source repo as well, so that it becomes conflicted.
+    test_env.jj_cmd_ok(
+        &target_jj_repo_path,
+        &["describe", "b", "-m=new_descr_for_b_to_create_conflict"],
+    );
+
+    // Our repo before and after fetch
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(get_log_output(&test_env, &target_jj_repo_path), @r"
+    @  6acbecf3f4d4
+    │ ○  114d76fff117 new_descr_for_b_to_create_conflict b*
+    │ │ ○  fd8cf6959754 descr_for_a2 a2
+    │ ├─╯
+    │ │ ○  0294c5914999 descr_for_a1 a1
+    │ ├─╯
+    │ ○  8f6283d767a1 descr_for_trunk1 trunk1
+    ├─╯
+    ◆  000000000000
+    ");
+    }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(get_bookmark_output(&test_env, &target_jj_repo_path), @r"
+    a1: mvvuowxt 0294c591 descr_for_a1
+      @git: mvvuowxt 0294c591 descr_for_a1
+      @origin: mvvuowxt 0294c591 descr_for_a1
+    a2: uprmlzux fd8cf695 descr_for_a2
+      @git: uprmlzux fd8cf695 descr_for_a2
+      @origin: uprmlzux fd8cf695 descr_for_a2
+    b: ypospnrw 114d76ff new_descr_for_b_to_create_conflict
+      @git: ypospnrw 114d76ff new_descr_for_b_to_create_conflict
+      @origin (ahead by 1 commits, behind by 1 commits): ypospnrw hidden 57e3eea9 descr_for_b
+    trunk1: woovuqxq 8f6283d7 descr_for_trunk1
+      @git: woovuqxq 8f6283d7 descr_for_trunk1
+      @origin: woovuqxq 8f6283d7 descr_for_trunk1
+    ");
+    }
+    let (stdout, stderr) = test_env.jj_cmd_ok(&target_jj_repo_path, &["git", "fetch"]);
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(stdout, @"");
+    }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(stderr, @r###"
+    bookmark: a1@origin     [updated] tracked
+    bookmark: a2@origin     [updated] tracked
+    bookmark: b@origin      [updated] tracked
+    bookmark: trunk2@origin [new] tracked
+    Abandoned 2 commits that are no longer reachable.
+    "###);
+    }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(get_bookmark_output(&test_env, &target_jj_repo_path), @r"
+    a1: ssxxlmpv 518eec71 descr_for_a1
+      @git: ssxxlmpv 518eec71 descr_for_a1
+      @origin: ssxxlmpv 518eec71 descr_for_a1
+    a2: vykzsspk 528dd27d descr_for_a2
+      @git: vykzsspk 528dd27d descr_for_a2
+      @origin: vykzsspk 528dd27d descr_for_a2
+    b (conflicted):
+      - ypospnrw hidden 57e3eea9 descr_for_b
+      + ypospnrw 114d76ff new_descr_for_b_to_create_conflict
+      + nmovwrnw 67b44a6c descr_for_b
+      @git (behind by 2 commits): ypospnrw 114d76ff new_descr_for_b_to_create_conflict
+      @origin (behind by 1 commits): nmovwrnw 67b44a6c descr_for_b
+    trunk1: woovuqxq 8f6283d7 descr_for_trunk1
+      @git: woovuqxq 8f6283d7 descr_for_trunk1
+      @origin: woovuqxq 8f6283d7 descr_for_trunk1
+    trunk2: unzmnpql 5e50a60c descr_for_trunk2
+      @git: unzmnpql 5e50a60c descr_for_trunk2
+      @origin: unzmnpql 5e50a60c descr_for_trunk2
+    ");
+    }
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(get_log_output(&test_env, &target_jj_repo_path), @r"
+    @  6acbecf3f4d4
+    │ ○  67b44a6cad31 descr_for_b b?? b@origin
+    │ │ ○  528dd27d4bde descr_for_a2 a2
+    │ ├─╯
+    │ │ ○  518eec71b3bd descr_for_a1 a1
+    │ ├─╯
+    │ ○  5e50a60c834f descr_for_trunk2 trunk2
+    │ │ ○  114d76fff117 new_descr_for_b_to_create_conflict b?? b@git
+    │ ├─╯
+    │ ○  8f6283d767a1 descr_for_trunk1 trunk1
+    ├─╯
+    ◆  000000000000
+    ");
+    }
+}
