@@ -56,16 +56,10 @@ pub fn init_bare(directory: impl AsRef<Path>) -> gix::Repository {
     .to_thread_local()
 }
 
-pub fn clone(dest_path: &Path, url: &str) -> gix::Repository {
-    let mut prepare_fetch = gix::clone::PrepareFetch::new(
-        url,
-        dest_path,
-        gix::create::Kind::WithWorktree,
-        gix::create::Options::default(),
-        open_options(),
-    )
-    .unwrap();
-    let (mut prepare_checkout, _outcome) = prepare_fetch
+pub fn clone(dest_path: &Path, repo_url: &str) -> gix::Repository {
+    std::fs::create_dir_all(&dest_path).unwrap();
+    let mut prepare_clone = gix::prepare_clone(repo_url, dest_path).unwrap();
+    let (mut prepare_checkout, _outcome) = prepare_clone
         .fetch_then_checkout(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .unwrap();
     let (repo, _outcome) = prepare_checkout
