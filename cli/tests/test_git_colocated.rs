@@ -98,28 +98,59 @@ fn test_git_colocated() {
 fn test_git_colocated_unborn_bookmark() {
     let test_env = TestEnvironment::default();
     let workspace_root = test_env.env_root().join("repo");
-    let git_repo = git2::Repository::init(&workspace_root).unwrap();
+    let git_repo = git::init(&workspace_root);
 
+    // add a file to an (in memory) index
     let add_file_to_index = |name: &str, data: &str| {
-        std::fs::write(workspace_root.join(name), data).unwrap();
-        let mut index = git_repo.index().unwrap();
-        index.add_path(Path::new(name)).unwrap();
-        index.write().unwrap();
+        let mut tree_editor = git_repo.head_tree().map(|t| t.edit().unwrap()).unwrap_or(
+            git_repo
+                .edit_tree(gix::ObjectId::empty_tree(git_repo.object_hash()))
+                .unwrap(),
+        );
+        let blob_oid = git_repo.write_blob(data).unwrap();
+        tree_editor
+            .upsert(name, gix::object::tree::EntryKind::Blob, blob_oid)
+            .unwrap();
+        let tree_id = tree_editor.write().unwrap().detach();
+        git::checkout_tree_index(&git_repo, tree_id);
     };
+
+    // checkout index (i.e., drop the in-memory changes)
     let checkout_index = || {
-        let mut index = git_repo.index().unwrap();
-        index.read(true).unwrap(); // discard in-memory cache
-        git_repo.checkout_index(Some(&mut index), None).unwrap();
+        let mut index = gix::index::File::at_or_default(
+            git_repo.index_path(),
+            git_repo.object_hash(),
+            true,
+            gix::index::decode::Options::default(),
+        )
+        .unwrap();
+        let objects = git_repo.objects.clone();
+        gix::worktree::state::checkout(
+            &mut index,
+            git_repo.work_dir().unwrap(),
+            objects,
+            &gix::progress::Discard,
+            &gix::progress::Discard,
+            &gix::interrupt::IS_INTERRUPTED,
+            gix::worktree::state::checkout::Options::default(),
+        )
+        .unwrap();
     };
 
     // Initially, HEAD isn't set.
     test_env
         .run_jj_in(&workspace_root, ["git", "init", "--git-repo", "."])
         .success();
-    assert!(git_repo.head().is_err());
+    assert!(git_repo.head().unwrap().is_unborn());
     assert_eq!(
-        git_repo.find_reference("HEAD").unwrap().symbolic_target(),
-        Some("refs/heads/master")
+        git_repo
+            .find_reference("HEAD")
+            .unwrap()
+            .target()
+            .try_name()
+            .unwrap()
+            .as_bstr(),
+        b"refs/heads/master"
     );
     insta::assert_snapshot!(get_log_output(&test_env, &workspace_root), @r"
     @  230dd059e1b059aefc0da06a2e5a7dbf22362f22
@@ -137,10 +168,16 @@ fn test_git_colocated_unborn_bookmark() {
     Added 0 files, modified 0 files, removed 1 files
     [EOF]
     ");
-    assert!(git_repo.head().is_err());
+    assert!(git_repo.head().unwrap().is_unborn());
     assert_eq!(
-        git_repo.find_reference("HEAD").unwrap().symbolic_target(),
-        Some("refs/heads/master")
+        git_repo
+            .find_reference("HEAD")
+            .unwrap()
+            .target()
+            .try_name()
+            .unwrap()
+            .as_bstr(),
+        b"refs/heads/master"
     );
     insta::assert_snapshot!(get_log_output(&test_env, &workspace_root), @r"
     @  fcdbbd731496cae17161cd6be9b6cf1f759655a8
@@ -168,9 +205,9 @@ fn test_git_colocated_unborn_bookmark() {
     Parent commit      : kkmpptxz e3e01407 (no description set)
     [EOF]
     ");
-    assert!(git_repo.head().unwrap().symbolic_target().is_none());
+    assert!(git_repo.head().unwrap().is_detached());
     insta::assert_snapshot!(
-        git_repo.head().unwrap().peel_to_commit().unwrap().id().to_string(),
+        git_repo.head_id().unwrap().to_string(),
         @"e3e01407bd3539722ae4ffff077700d97c60cb11"
     );
     insta::assert_snapshot!(get_log_output(&test_env, &workspace_root), @r"
@@ -206,7 +243,7 @@ fn test_git_colocated_unborn_bookmark() {
     Added 0 files, modified 0 files, removed 2 files
     [EOF]
     ");
-    assert!(git_repo.head().is_err());
+    assert!(git_repo.head().unwrap().is_unborn());
     insta::assert_snapshot!(get_log_output(&test_env, &workspace_root), @r"
     @  10dd328bb906e15890e55047740eab2812a3b2f7
     │ ○  ef75c0b0dcc9b080e00226908c21316acaa84dc6

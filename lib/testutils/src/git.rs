@@ -57,7 +57,7 @@ pub fn init_bare(directory: impl AsRef<Path>) -> gix::Repository {
 }
 
 pub fn clone(dest_path: &Path, repo_url: &str) -> gix::Repository {
-    std::fs::create_dir_all(&dest_path).unwrap();
+    std::fs::create_dir_all(dest_path).unwrap();
     let mut prepare_clone = gix::prepare_clone(repo_url, dest_path).unwrap();
     let (mut prepare_checkout, _outcome) = prepare_clone
         .fetch_then_checkout(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
