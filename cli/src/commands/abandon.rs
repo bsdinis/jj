@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
+use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::CommitIteratorExt as _;
@@ -47,14 +47,14 @@ pub(crate) struct AbandonArgs {
     /// The revision(s) to abandon (default: @)
     #[arg(
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     revisions_pos: Vec<RevisionArg>,
     #[arg(
         short = 'r',
         hide = true,
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     revisions_opt: Vec<RevisionArg>,
     // TODO: Remove in jj 0.34+
@@ -174,9 +174,9 @@ pub(crate) fn cmd_abandon(
             .any(|name| has_tracked_remote_bookmarks(view, name))
         {
             writeln!(
-                ui.warning_default(),
-                "Remote bookmarks tracked by deleted bookmarks will be deleted on the next `jj \
-                 git push`."
+                ui.hint_default(),
+                "Deleted bookmarks can be pushed by name or all at once with `jj git push \
+                 --deleted`."
             )?;
         }
     }

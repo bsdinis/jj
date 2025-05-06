@@ -402,6 +402,7 @@ pub struct MoveCommitsStats {
     pub num_abandoned: u32,
 }
 
+#[derive(Clone, Debug)]
 pub enum MoveCommitsTarget {
     /// The commits to be moved. Commits should be mutable and in reverse
     /// topological order.
@@ -444,12 +445,11 @@ pub fn move_commits(
                 RevsetExpression::commits(target_commits.iter().ids().cloned().collect_vec())
                     .connected()
                     .evaluate(mut_repo)
-                    .map_err(|err| err.expect_backend_error())?
+                    .map_err(|err| err.into_backend_error())?
                     .iter()
                     .commits(mut_repo.store())
                     .try_collect()
-                    // TODO: Return evaluation error to caller
-                    .map_err(|err| err.expect_backend_error())?;
+                    .map_err(|err| err.into_backend_error())?;
             connected_target_commits_internal_parents =
                 compute_internal_parents_within(&target_commit_ids, &connected_target_commits);
 
@@ -469,12 +469,11 @@ pub fn move_commits(
             target_commits = RevsetExpression::commits(roots.iter().ids().cloned().collect_vec())
                 .descendants()
                 .evaluate(mut_repo)
-                .map_err(|err| err.expect_backend_error())?
+                .map_err(|err| err.into_backend_error())?
                 .iter()
                 .commits(mut_repo.store())
                 .try_collect()
-                // TODO: Return evaluation error to caller
-                .map_err(|err| err.expect_backend_error())?;
+                .map_err(|err| err.into_backend_error())?;
             target_commit_ids = target_commits.iter().ids().cloned().collect();
 
             connected_target_commits = target_commits.iter().cloned().collect_vec();
@@ -529,12 +528,11 @@ pub fn move_commits(
                         .children(),
                 )
                 .evaluate(mut_repo)
-                .map_err(|err| err.expect_backend_error())?
+                .map_err(|err| err.into_backend_error())?
                 .iter()
                 .commits(mut_repo.store())
                 .try_collect()
-                // TODO: Return evaluation error to caller
-                .map_err(|err| err.expect_backend_error())?;
+                .map_err(|err| err.into_backend_error())?;
 
         // For all commits in the target set, compute its transitive descendant commits
         // which are outside of the target set by up to 1 generation.
@@ -769,6 +767,10 @@ pub struct DuplicateCommitsStats {
 /// `children_commit_ids` is not empty, the `children_commit_ids` will be
 /// rebased onto the heads of the duplicated target commits.
 ///
+/// If `target_descriptions` is not empty, it will be consulted to retrieve the
+/// new descriptions of the target commits, falling back to the original if
+/// the map does not contain an entry for a given commit.
+///
 /// This assumes that commits in `children_commit_ids` can be rewritten. There
 /// should also be no cycles in the resulting graph, i.e. `children_commit_ids`
 /// should not be ancestors of `parent_commit_ids`. Commits in `target_commits`
@@ -776,6 +778,7 @@ pub struct DuplicateCommitsStats {
 pub fn duplicate_commits(
     mut_repo: &mut MutableRepo,
     target_commits: &[CommitId],
+    target_descriptions: &HashMap<CommitId, String>,
     parent_commit_ids: &[CommitId],
     children_commit_ids: &[CommitId],
 ) -> BackendResult<DuplicateCommitsStats> {
@@ -792,12 +795,11 @@ pub fn duplicate_commits(
         RevsetExpression::commits(target_commit_ids.iter().cloned().collect_vec())
             .connected()
             .evaluate(mut_repo)
-            .map_err(|err| err.expect_backend_error())?
+            .map_err(|err| err.into_backend_error())?
             .iter()
             .commits(mut_repo.store())
             .try_collect()
-            // TODO: Return evaluation error to caller
-            .map_err(|err| err.expect_backend_error())?;
+            .map_err(|err| err.into_backend_error())?;
 
     // Commits in the target set should only have other commits in the set as
     // parents, except the roots of the set, which persist their original
@@ -847,11 +849,13 @@ pub fn duplicate_commits(
                 })
                 .collect()
         };
-        let new_commit = CommitRewriter::new(mut_repo, original_commit, new_parent_ids)
+        let mut new_commit_builder = CommitRewriter::new(mut_repo, original_commit, new_parent_ids)
             .rebase()?
-            .generate_new_change_id()
-            .write()?;
-        duplicated_old_to_new.insert(original_commit_id.clone(), new_commit);
+            .generate_new_change_id();
+        if let Some(desc) = target_descriptions.get(original_commit_id) {
+            new_commit_builder = new_commit_builder.set_description(desc);
+        }
+        duplicated_old_to_new.insert(original_commit_id.clone(), new_commit_builder.write()?);
     }
 
     // Replace the original commit IDs in `target_head_ids` with the duplicated
@@ -902,9 +906,14 @@ pub fn duplicate_commits(
 ///
 /// Commits in `target_commits` should be in reverse topological order (children
 /// before parents).
+///
+/// If `target_descriptions` is not empty, it will be consulted to retrieve the
+/// new descriptions of the target commits, falling back to the original if
+/// the map does not contain an entry for a given commit.
 pub fn duplicate_commits_onto_parents(
     mut_repo: &mut MutableRepo,
     target_commits: &[CommitId],
+    target_descriptions: &HashMap<CommitId, String>,
 ) -> BackendResult<DuplicateCommitsStats> {
     if target_commits.is_empty() {
         return Ok(DuplicateCommitsStats::default());
@@ -926,12 +935,14 @@ pub fn duplicate_commits_onto_parents(
                     .clone()
             })
             .collect();
-        let new_commit = mut_repo
+        let mut new_commit_builder = mut_repo
             .rewrite_commit(&original_commit)
             .generate_new_change_id()
-            .set_parents(new_parent_ids)
-            .write()?;
-        duplicated_old_to_new.insert(original_commit_id.clone(), new_commit);
+            .set_parents(new_parent_ids);
+        if let Some(desc) = target_descriptions.get(original_commit_id) {
+            new_commit_builder = new_commit_builder.set_description(desc);
+        }
+        duplicated_old_to_new.insert(original_commit_id.clone(), new_commit_builder.write()?);
     }
 
     Ok(DuplicateCommitsStats {

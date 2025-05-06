@@ -531,6 +531,42 @@ fn test_diff_name_only() {
 }
 
 #[test]
+fn test_diff_renamed_file_and_dir() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("x", "content1");
+    work_dir.create_dir("y");
+    work_dir.write_file("y/file", "content2");
+    work_dir.run_jj(["new"]).success();
+    work_dir.remove_file("x");
+    work_dir.remove_dir_all("y");
+    work_dir.create_dir("x");
+    work_dir.write_file("x/file", "content2");
+    work_dir.write_file("y", "content1");
+
+    // Renamed directory y->x shouldn't be reported
+    let output = work_dir.run_jj(["diff", "--summary"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r"
+    R {y => x}/file
+    R {x => y}
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["diff", "--git"]);
+    insta::assert_snapshot!(output, @r"
+    diff --git a/y/file b/x/file
+    rename from y/file
+    rename to x/file
+    diff --git a/x b/y
+    rename from x
+    rename to y
+    [EOF]
+    ");
+}
+
+#[test]
 fn test_diff_bad_args() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();

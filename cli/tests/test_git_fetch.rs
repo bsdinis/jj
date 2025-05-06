@@ -287,7 +287,8 @@ fn test_git_fetch_with_glob_with_no_matching_remotes() {
     let output = work_dir.run_jj(["git", "fetch", "--remote=glob:rem*"]);
     insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Error: No matching git remotes for patterns: rem*
+    Warning: No git remotes matching 'rem*'
+    Error: No git remotes to push
     [EOF]
     [exit status: 1]
     ");
@@ -343,6 +344,23 @@ fn test_git_fetch_multiple_remotes_from_config() {
 }
 
 #[test]
+fn test_git_fetch_no_matching_remote() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    let output = work_dir.run_jj(["git", "fetch", "--remote", "rem1"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Warning: No git remotes matching 'rem1'
+    Error: No git remotes to push
+    [EOF]
+    [exit status: 1]
+    ");
+    insta::assert_snapshot!(get_bookmark_output(&work_dir), @"");
+}
+
+#[test]
 fn test_git_fetch_nonexistent_remote() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
@@ -352,12 +370,15 @@ fn test_git_fetch_nonexistent_remote() {
     let output = work_dir.run_jj(["git", "fetch", "--remote", "rem1", "--remote", "rem2"]);
     insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Error: No git remote named 'rem2'
+    Warning: No git remotes matching 'rem2'
+    bookmark: rem1@rem1 [new] untracked
     [EOF]
-    [exit status: 1]
     ");
     // No remote should have been fetched as part of the failing transaction
-    insta::assert_snapshot!(get_bookmark_output(&work_dir), @"");
+    insta::assert_snapshot!(get_bookmark_output(&work_dir), @r"
+    rem1@rem1: ppspxspk 4acd0343 message
+    [EOF]
+    ");
 }
 
 #[test]
@@ -371,12 +392,14 @@ fn test_git_fetch_nonexistent_remote_from_config() {
     let output = work_dir.run_jj(["git", "fetch"]);
     insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Error: No git remote named 'rem2'
+    Warning: No git remotes matching 'rem2'
+    bookmark: rem1@rem1 [new] untracked
     [EOF]
-    [exit status: 1]
     ");
-    // No remote should have been fetched as part of the failing transaction
-    insta::assert_snapshot!(get_bookmark_output(&work_dir), @"");
+    insta::assert_snapshot!(get_bookmark_output(&work_dir), @r"
+    rem1@rem1: ppspxspk 4acd0343 message
+    [EOF]
+    ");
 }
 
 #[test]

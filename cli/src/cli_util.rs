@@ -152,6 +152,7 @@ use crate::command_error::user_error_with_hint;
 use crate::command_error::CommandError;
 use crate::commit_templater::CommitTemplateLanguage;
 use crate::commit_templater::CommitTemplateLanguageExtension;
+use crate::commit_templater::CommitTemplatePropertyKind;
 use crate::complete;
 use crate::config::config_from_environment;
 use crate::config::parse_config_args;
@@ -171,13 +172,14 @@ use crate::merge_tools::MergeEditor;
 use crate::merge_tools::MergeToolConfigError;
 use crate::operation_templater::OperationTemplateLanguage;
 use crate::operation_templater::OperationTemplateLanguageExtension;
+use crate::operation_templater::OperationTemplatePropertyKind;
 use crate::revset_util;
 use crate::revset_util::RevsetExpressionEvaluator;
 use crate::template_builder;
 use crate::template_builder::TemplateLanguage;
 use crate::template_parser::TemplateAliasesMap;
 use crate::template_parser::TemplateDiagnostics;
-use crate::templater::PropertyPlaceholder;
+use crate::templater::BoxedTemplateProperty;
 use crate::templater::TemplateRenderer;
 use crate::text_util;
 use crate::ui::ColorChoice;
@@ -386,7 +388,7 @@ impl CommandHelper {
         ui: &Ui,
         language: &L,
         template_text: &str,
-        wrap_self: impl Fn(PropertyPlaceholder<C>) -> L::Property,
+        wrap_self: impl Fn(BoxedTemplateProperty<'a, C>) -> L::Property,
     ) -> Result<TemplateRenderer<'a, C>, CommandError> {
         let mut diagnostics = TemplateDiagnostics::new();
         let aliases = load_template_aliases(ui, self.settings().config())?;
@@ -664,7 +666,7 @@ impl CommandHelper {
                         }
                     }
                     Ok(tx
-                        .write("reconcile divergent operations")
+                        .write("reconcile divergent operations")?
                         .leave_unpublished()
                         .operation()
                         .clone())
@@ -974,7 +976,7 @@ impl WorkspaceCommandEnvironment {
         ui: &Ui,
         language: &L,
         template_text: &str,
-        wrap_self: impl Fn(PropertyPlaceholder<C>) -> L::Property,
+        wrap_self: impl Fn(BoxedTemplateProperty<'a, C>) -> L::Property,
     ) -> Result<TemplateRenderer<'a, C>, CommandError> {
         let mut diagnostics = TemplateDiagnostics::new();
         let template = template_builder::parse(
@@ -1565,10 +1567,8 @@ to the current parents may contain changes from multiple commits.
     }
 
     /// Loads text editor from the settings.
-    ///
-    /// Temporary files will be created in the repository directory.
     pub fn text_editor(&self) -> Result<TextEditor, ConfigGetError> {
-        Ok(TextEditor::from_settings(self.settings())?.with_temp_dir(self.repo_path()))
+        TextEditor::from_settings(self.settings())
     }
 
     pub fn resolve_single_op(&self, op_str: &str) -> Result<Operation, OpsetEvaluationError> {
@@ -1706,7 +1706,7 @@ to the current parents may contain changes from multiple commits.
         ui: &Ui,
         language: &L,
         template_text: &str,
-        wrap_self: impl Fn(PropertyPlaceholder<C>) -> L::Property,
+        wrap_self: impl Fn(BoxedTemplateProperty<'a, C>) -> L::Property,
     ) -> Result<TemplateRenderer<'a, C>, CommandError> {
         self.env
             .parse_template(ui, language, template_text, wrap_self)
@@ -1717,7 +1717,7 @@ to the current parents may contain changes from multiple commits.
         &self,
         language: &L,
         template_text: &str,
-        wrap_self: impl Fn(PropertyPlaceholder<C>) -> L::Property,
+        wrap_self: impl Fn(BoxedTemplateProperty<'a, C>) -> L::Property,
     ) -> TemplateRenderer<'a, C> {
         template_builder::parse(
             language,
@@ -1740,7 +1740,7 @@ to the current parents may contain changes from multiple commits.
             ui,
             &language,
             template_text,
-            CommitTemplateLanguage::wrap_commit,
+            CommitTemplatePropertyKind::wrap_commit,
         )
     }
 
@@ -1755,7 +1755,7 @@ to the current parents may contain changes from multiple commits.
             ui,
             &language,
             template_text,
-            OperationTemplateLanguage::wrap_operation,
+            OperationTemplatePropertyKind::wrap_operation,
         )
     }
 
@@ -1780,7 +1780,7 @@ to the current parents may contain changes from multiple commits.
         self.reparse_valid_template(
             &language,
             &self.commit_summary_template_text,
-            CommitTemplateLanguage::wrap_commit,
+            CommitTemplatePropertyKind::wrap_commit,
         )
     }
 
@@ -1790,7 +1790,7 @@ to the current parents may contain changes from multiple commits.
         self.reparse_valid_template(
             &language,
             &self.op_summary_template_text,
-            OperationTemplateLanguage::wrap_operation,
+            OperationTemplatePropertyKind::wrap_operation,
         )
         .labeled("operation")
     }
@@ -1800,7 +1800,7 @@ to the current parents may contain changes from multiple commits.
         self.reparse_valid_template(
             &language,
             SHORT_CHANGE_ID_TEMPLATE_TEXT,
-            CommitTemplateLanguage::wrap_commit,
+            CommitTemplatePropertyKind::wrap_commit,
         )
     }
 
@@ -2462,7 +2462,7 @@ impl WorkspaceCommandTransaction<'_> {
         self.helper.reparse_valid_template(
             &language,
             &self.helper.commit_summary_template_text,
-            CommitTemplateLanguage::wrap_commit,
+            CommitTemplatePropertyKind::wrap_commit,
         )
     }
 
@@ -2488,7 +2488,7 @@ impl WorkspaceCommandTransaction<'_> {
             ui,
             &language,
             template_text,
-            CommitTemplateLanguage::wrap_commit,
+            CommitTemplatePropertyKind::wrap_commit,
         )
     }
 
@@ -3091,7 +3091,7 @@ impl fmt::Display for RemoteBookmarkNamePattern {
 /// The `destination` argument is mutually exclusive to the `insert_after` and
 /// `insert_before` arguments.
 pub fn compute_commit_location(
-    ui: &mut Ui,
+    ui: &Ui,
     workspace_command: &WorkspaceCommandHelper,
     destination: Option<&[RevisionArg]>,
     insert_after: Option<&[RevisionArg]>,
@@ -3553,29 +3553,55 @@ fn handle_shell_completion(
     config: &StackedConfig,
     cwd: &Path,
 ) -> Result<(), CommandError> {
+    let mut orig_args = env::args_os();
+
     let mut args = vec![];
     // Take the first two arguments as is, they must be passed to clap_complete
     // without any changes. They are usually "jj --".
-    args.extend(env::args_os().take(2));
+    args.extend(orig_args.by_ref().take(2));
 
     // Make sure aliases are expanded before passing them to clap_complete. We
     // skip the first two args ("jj" and "--") for alias resolution, then we
     // stitch the args back together, like clap_complete expects them.
-    let orig_args = env::args_os().skip(2);
     if orig_args.len() > 0 {
-        let arg_index: Option<usize> = env::var("_CLAP_COMPLETE_INDEX")
+        let complete_index: Option<usize> = env::var("_CLAP_COMPLETE_INDEX")
             .ok()
             .and_then(|s| s.parse().ok());
-        let resolved_aliases = if let Some(index) = arg_index {
+        let resolved_aliases = if let Some(index) = complete_index {
             // As of clap_complete 4.5.38, zsh completion script doesn't pad an
             // empty arg at the complete position. If the args doesn't include a
             // command name, the default command would be expanded at that
             // position. Therefore, no other command names would be suggested.
-            // TODO: Maybe we should instead expand args[..index] + [""], adjust
-            // the index accordingly, strip the last "", and append remainder?
             let pad_len = usize::saturating_sub(index + 1, orig_args.len());
-            let padded_args = orig_args.chain(std::iter::repeat_n(OsString::new(), pad_len));
-            expand_args(ui, app, padded_args, config)?
+            let padded_args = orig_args
+                .by_ref()
+                .chain(std::iter::repeat_n(OsString::new(), pad_len));
+
+            // Expand aliases left of the completion index.
+            let mut expanded_args = expand_args(ui, app, padded_args.take(index + 1), config)?;
+
+            // Adjust env var to compensate for shift of the completion point in the
+            // expanded command line.
+            // SAFETY: Program is running single-threaded at this point.
+            unsafe {
+                env::set_var(
+                    "_CLAP_COMPLETE_INDEX",
+                    (expanded_args.len() - 1).to_string(),
+                );
+            }
+
+            // Remove extra padding again to align with clap_complete's expectations for
+            // zsh.
+            let split_off_padding = expanded_args.split_off(expanded_args.len() - pad_len);
+            assert!(
+                split_off_padding.iter().all(|s| s.is_empty()),
+                "split-off padding should only consist of empty strings but was \
+                 {split_off_padding:?}",
+            );
+
+            // Append the remaining arguments to the right of the completion point.
+            expanded_args.extend(to_string_args(orig_args)?);
+            expanded_args
         } else {
             expand_args(ui, app, orig_args, config)?
         };
@@ -3600,17 +3626,22 @@ pub fn expand_args(
     args_os: impl IntoIterator<Item = OsString>,
     config: &StackedConfig,
 ) -> Result<Vec<String>, CommandError> {
-    let mut string_args: Vec<String> = vec![];
-    for arg_os in args_os {
-        if let Some(string_arg) = arg_os.to_str() {
-            string_args.push(string_arg.to_owned());
-        } else {
-            return Err(cli_error("Non-utf8 argument"));
-        }
-    }
-
+    let string_args = to_string_args(args_os)?;
     let string_args = resolve_default_command(ui, config, app, string_args)?;
     resolve_aliases(ui, config, app, string_args)
+}
+
+fn to_string_args(
+    args_os: impl IntoIterator<Item = OsString>,
+) -> Result<Vec<String>, CommandError> {
+    args_os
+        .into_iter()
+        .map(|arg_os| {
+            arg_os
+                .into_string()
+                .map_err(|_| cli_error("Non-UTF-8 argument"))
+        })
+        .collect()
 }
 
 fn parse_args(app: &Command, string_args: &[String]) -> Result<(ArgMatches, Args), clap::Error> {
@@ -3646,7 +3677,7 @@ pub fn format_template<C: Clone>(ui: &Ui, arg: &C, template: &TemplateRenderer<C
 
 /// CLI command builder and runner.
 #[must_use]
-pub struct CliRunner {
+pub struct CliRunner<'a> {
     tracing_subscription: TracingSubscription,
     app: Command,
     config_layers: Vec<ConfigLayer>,
@@ -3657,16 +3688,21 @@ pub struct CliRunner {
     revset_extensions: RevsetExtensions,
     commit_template_extensions: Vec<Arc<dyn CommitTemplateLanguageExtension>>,
     operation_template_extensions: Vec<Arc<dyn OperationTemplateLanguageExtension>>,
-    dispatch_fn: CliDispatchFn,
-    start_hook_fns: Vec<CliDispatchFn>,
-    process_global_args_fns: Vec<ProcessGlobalArgsFn>,
+    dispatch_fn: CliDispatchFn<'a>,
+    dispatch_hook_fns: Vec<CliDispatchHookFn<'a>>,
+    process_global_args_fns: Vec<ProcessGlobalArgsFn<'a>>,
 }
 
-type CliDispatchFn = Box<dyn FnOnce(&mut Ui, &CommandHelper) -> Result<(), CommandError>>;
+pub type CliDispatchFn<'a> =
+    Box<dyn FnOnce(&mut Ui, &CommandHelper) -> Result<(), CommandError> + 'a>;
 
-type ProcessGlobalArgsFn = Box<dyn FnOnce(&mut Ui, &ArgMatches) -> Result<(), CommandError>>;
+type CliDispatchHookFn<'a> =
+    Box<dyn FnOnce(&mut Ui, &CommandHelper, CliDispatchFn<'a>) -> Result<(), CommandError> + 'a>;
 
-impl CliRunner {
+type ProcessGlobalArgsFn<'a> =
+    Box<dyn FnOnce(&mut Ui, &ArgMatches) -> Result<(), CommandError> + 'a>;
+
+impl<'a> CliRunner<'a> {
     /// Initializes CLI environment and returns a builder. This should be called
     /// as early as possible.
     pub fn init() -> Self {
@@ -3684,7 +3720,7 @@ impl CliRunner {
             commit_template_extensions: vec![],
             operation_template_extensions: vec![],
             dispatch_fn: Box::new(crate::commands::run_command),
-            start_hook_fns: vec![],
+            dispatch_hook_fns: vec![],
             process_global_args_fns: vec![],
         }
     }
@@ -3781,8 +3817,14 @@ impl CliRunner {
         self
     }
 
-    pub fn add_start_hook(mut self, start_hook_fn: CliDispatchFn) -> Self {
-        self.start_hook_fns.push(start_hook_fn);
+    /// Add a hook that gets called when it's time to run the command. It is
+    /// the hook's responsibility to call the given inner dispatch function to
+    /// run the command.
+    pub fn add_dispatch_hook<F>(mut self, dispatch_hook_fn: F) -> Self
+    where
+        F: FnOnce(&mut Ui, &CommandHelper, CliDispatchFn) -> Result<(), CommandError> + 'a,
+    {
+        self.dispatch_hook_fns.push(Box::new(dispatch_hook_fn));
         self
     }
 
@@ -3790,7 +3832,7 @@ impl CliRunner {
     pub fn add_subcommand<C, F>(mut self, custom_dispatch_fn: F) -> Self
     where
         C: clap::Subcommand,
-        F: FnOnce(&mut Ui, &CommandHelper, C) -> Result<(), CommandError> + 'static,
+        F: FnOnce(&mut Ui, &CommandHelper, C) -> Result<(), CommandError> + 'a,
     {
         let old_dispatch_fn = self.dispatch_fn;
         let new_dispatch_fn =
@@ -3809,7 +3851,7 @@ impl CliRunner {
     pub fn add_global_args<A, F>(mut self, process_before: F) -> Self
     where
         A: clap::Args,
-        F: FnOnce(&mut Ui, A) -> Result<(), CommandError> + 'static,
+        F: FnOnce(&mut Ui, A) -> Result<(), CommandError> + 'a,
     {
         let process_global_args_fn = move |ui: &mut Ui, matches: &ArgMatches| {
             let custom_args = A::from_arg_matches(matches).unwrap();
@@ -3833,7 +3875,7 @@ impl CliRunner {
                     "Did you update to a commit where the directory doesn't exist?",
                 )
             })?;
-        let mut config_env = ConfigEnv::from_environment();
+        let mut config_env = ConfigEnv::from_environment(ui);
         let mut last_config_migration_descriptions = Vec::new();
         let mut migrate_config = |config: &mut StackedConfig| -> Result<(), CommandError> {
             last_config_migration_descriptions =
@@ -3942,10 +3984,15 @@ impl CliRunner {
         let command_helper = CommandHelper {
             data: Rc::new(command_helper_data),
         };
-        for start_hook_fn in self.start_hook_fns {
-            start_hook_fn(ui, &command_helper)?;
-        }
-        (self.dispatch_fn)(ui, &command_helper)
+        let dispatch_fn = self.dispatch_hook_fns.into_iter().fold(
+            self.dispatch_fn,
+            |old_dispatch_fn, dispatch_hook_fn| {
+                Box::new(move |ui: &mut Ui, command_helper: &CommandHelper| {
+                    dispatch_hook_fn(ui, command_helper, old_dispatch_fn)
+                })
+            },
+        );
+        (dispatch_fn)(ui, &command_helper)
     }
 
     #[must_use]

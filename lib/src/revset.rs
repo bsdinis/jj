@@ -87,8 +87,8 @@ pub enum RevsetResolutionError {
     AmbiguousCommitIdPrefix(String),
     #[error("Change ID prefix `{0}` is ambiguous")]
     AmbiguousChangeIdPrefix(String),
-    #[error("Unexpected error from store")]
-    StoreError(#[source] BackendError),
+    #[error("Unexpected error from commit backend")]
+    Backend(#[source] BackendError),
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
@@ -96,17 +96,19 @@ pub enum RevsetResolutionError {
 /// Error occurred during revset evaluation.
 #[derive(Debug, Error)]
 pub enum RevsetEvaluationError {
-    #[error("Unexpected error from store")]
-    StoreError(#[from] BackendError),
+    #[error("Unexpected error from commit backend")]
+    Backend(#[from] BackendError),
     #[error(transparent)]
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl RevsetEvaluationError {
-    pub fn expect_backend_error(self) -> BackendError {
+    // TODO: Create a higher-level error instead of putting non-BackendErrors in a
+    // BackendError
+    pub fn into_backend_error(self) -> BackendError {
         match self {
-            Self::StoreError(err) => err,
-            Self::Other(err) => panic!("Unexpected revset error: {err}"),
+            Self::Backend(err) => err,
+            Self::Other(err) => BackendError::Other(err),
         }
     }
 }
@@ -181,6 +183,8 @@ pub enum RevsetFilterPredicate {
     },
     /// Commits with conflicts
     HasConflict,
+    /// Commits that are cryptographically signed.
+    Signed,
     /// Custom predicates provided by extensions
     Extension(Rc<dyn RevsetFilterExtension>),
 }
@@ -830,6 +834,11 @@ static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy:
         Ok(RevsetExpression::filter(RevsetFilterPredicate::AuthorDate(
             pattern,
         )))
+    });
+    map.insert("signed", |_diagnostics, function, _context| {
+        function.expect_no_arguments()?;
+        let predicate = RevsetFilterPredicate::Signed;
+        Ok(RevsetExpression::filter(predicate))
     });
     map.insert("mine", |_diagnostics, function, context| {
         function.expect_no_arguments()?;
@@ -1803,11 +1812,12 @@ fn reload_repo_at_operation(
     let operation = op_walk::resolve_op_with_repo(base_repo, op_str)
         .map_err(|err| RevsetResolutionError::Other(err.into()))?;
     base_repo.reload_at(&operation).map_err(|err| match err {
-        RepoLoaderError::Backend(err) => RevsetResolutionError::StoreError(err),
+        RepoLoaderError::Backend(err) => RevsetResolutionError::Backend(err),
         RepoLoaderError::IndexRead(_)
         | RepoLoaderError::OpHeadResolution(_)
         | RepoLoaderError::OpHeadsStoreError(_)
-        | RepoLoaderError::OpStore(_) => RevsetResolutionError::Other(err.into()),
+        | RepoLoaderError::OpStore(_)
+        | RepoLoaderError::TransactionCommit(_) => RevsetResolutionError::Other(err.into()),
     })
 }
 
@@ -2197,7 +2207,7 @@ impl ExpressionStateFolder<UserExpressionState, ResolvedExpressionState>
                     RevsetResolutionError::EmptyString
                     | RevsetResolutionError::AmbiguousCommitIdPrefix(_)
                     | RevsetResolutionError::AmbiguousChangeIdPrefix(_)
-                    | RevsetResolutionError::StoreError(_)
+                    | RevsetResolutionError::Backend(_)
                     | RevsetResolutionError::Other(_) => Err(err),
                 })
             }
@@ -2521,7 +2531,7 @@ impl<I: Iterator<Item = Result<CommitId, RevsetEvaluationError>>> Iterator
             let commit_id = commit_id?;
             self.store
                 .get_commit(&commit_id)
-                .map_err(RevsetEvaluationError::StoreError)
+                .map_err(RevsetEvaluationError::Backend)
         })
     }
 }
@@ -3245,6 +3255,7 @@ mod tests {
             ),
         )
         "#);
+        insta::assert_debug_snapshot!(parse("signed()").unwrap(), @"Filter(Signed)");
     }
 
     #[test]

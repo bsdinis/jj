@@ -15,9 +15,9 @@
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use jj_lib::annotate::get_annotation_for_file;
-use jj_lib::annotate::get_annotation_with_file_content;
+use itertools::Itertools as _;
 use jj_lib::annotate::FileAnnotation;
+use jj_lib::annotate::FileAnnotator;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::MergedTreeId;
 use jj_lib::backend::MillisSinceEpoch;
@@ -31,6 +31,7 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::revset::RevsetExpression;
 use testutils::create_tree;
+use testutils::repo_path;
 use testutils::TestRepo;
 
 fn create_commit_fn(
@@ -68,8 +69,9 @@ fn annotate_within(
     domain: &Rc<ResolvedRevsetExpression>,
     file_path: &RepoPath,
 ) -> String {
-    let annotation = get_annotation_for_file(repo, commit, domain, file_path).unwrap();
-    format_annotation(repo, &annotation)
+    let mut annotator = FileAnnotator::from_commit(commit, file_path).unwrap();
+    annotator.compute(repo, domain).unwrap();
+    format_annotation(repo, &annotator.to_annotation())
 }
 
 fn annotate_parent_tree(repo: &dyn Repo, commit: &Commit, file_path: &RepoPath) -> String {
@@ -83,10 +85,9 @@ fn annotate_parent_tree(repo: &dyn Repo, commit: &Commit, file_path: &RepoPath) 
         }
         value => panic!("unexpected path value: {value:?}"),
     };
-    let domain = RevsetExpression::all();
-    let annotation =
-        get_annotation_with_file_content(repo, commit.id(), &domain, file_path, text).unwrap();
-    format_annotation(repo, &annotation)
+    let mut annotator = FileAnnotator::with_file_content(commit.id(), file_path, text);
+    annotator.compute(repo, &RevsetExpression::all()).unwrap();
+    format_annotation(repo, &annotator.to_annotation())
 }
 
 fn format_annotation(repo: &dyn Repo, annotation: &FileAnnotation) -> String {
@@ -107,7 +108,7 @@ fn test_annotate_linear() {
     let repo = &test_repo.repo;
 
     let root_commit_id = repo.store().root_commit_id();
-    let file_path = RepoPath::from_internal_string("file");
+    let file_path = repo_path("file");
 
     let mut tx = repo.start_transaction();
     let mut create_commit = create_commit_fn(tx.repo_mut());
@@ -144,7 +145,7 @@ fn test_annotate_merge_simple() {
     let repo = &test_repo.repo;
 
     let root_commit_id = repo.store().root_commit_id();
-    let file_path = RepoPath::from_internal_string("file");
+    let file_path = repo_path("file");
 
     // 4    "2 1 3"
     // |\
@@ -210,6 +211,43 @@ fn test_annotate_merge_simple() {
     commit1 : 1
     commit4 : 3
     ");
+
+    // Calculate incrementally
+    let mut annotator = FileAnnotator::from_commit(&commit4, file_path).unwrap();
+    assert_eq!(annotator.pending_commits().collect_vec(), [commit4.id()]);
+    insta::assert_snapshot!(format_annotation(tx.repo(), &annotator.to_annotation()), @r"
+    commit4*: 2
+    commit4*: 1
+    commit4*: 3
+    ");
+    annotator
+        .compute(
+            tx.repo(),
+            &RevsetExpression::commits(vec![
+                commit4.id().clone(),
+                commit3.id().clone(),
+                commit2.id().clone(),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(annotator.pending_commits().collect_vec(), [commit1.id()]);
+    insta::assert_snapshot!(format_annotation(tx.repo(), &annotator.to_annotation()), @r"
+    commit2 : 2
+    commit2*: 1
+    commit3 : 3
+    ");
+    annotator
+        .compute(
+            tx.repo(),
+            &RevsetExpression::commits(vec![commit1.id().clone()]),
+        )
+        .unwrap();
+    assert!(annotator.pending_commits().next().is_none());
+    insta::assert_snapshot!(format_annotation(tx.repo(), &annotator.to_annotation()), @r"
+    commit2 : 2
+    commit1 : 1
+    commit3 : 3
+    ");
 }
 
 #[test]
@@ -218,7 +256,7 @@ fn test_annotate_merge_split() {
     let repo = &test_repo.repo;
 
     let root_commit_id = repo.store().root_commit_id();
-    let file_path = RepoPath::from_internal_string("file");
+    let file_path = repo_path("file");
 
     // 4    "2 1a 1b 3 4"
     // |\
@@ -258,7 +296,7 @@ fn test_annotate_merge_split_interleaved() {
     let repo = &test_repo.repo;
 
     let root_commit_id = repo.store().root_commit_id();
-    let file_path = RepoPath::from_internal_string("file");
+    let file_path = repo_path("file");
 
     // 6    "1a 4 1b 6 2a 5 2b"
     // |\
@@ -310,7 +348,7 @@ fn test_annotate_merge_dup() {
     let repo = &test_repo.repo;
 
     let root_commit_id = repo.store().root_commit_id();
-    let file_path = RepoPath::from_internal_string("file");
+    let file_path = repo_path("file");
 
     // 4    "2 1 1 3 4"
     // |\
@@ -362,8 +400,8 @@ fn test_annotate_file_directory_transition() {
     let repo = &test_repo.repo;
 
     let root_commit_id = repo.store().root_commit_id();
-    let file_path1 = RepoPath::from_internal_string("file/was_dir");
-    let file_path2 = RepoPath::from_internal_string("file");
+    let file_path1 = repo_path("file/was_dir");
+    let file_path2 = repo_path("file");
 
     let mut tx = repo.start_transaction();
     let mut create_commit = create_commit_fn(tx.repo_mut());

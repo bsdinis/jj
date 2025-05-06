@@ -13,7 +13,6 @@
 // limitations under the License.
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use jj_lib::commit::Commit;
 use jj_lib::matchers::Matcher;
@@ -30,6 +29,7 @@ use crate::cli_util::WorkspaceCommandTransaction;
 use crate::command_error::user_error_with_hint;
 use crate::command_error::CommandError;
 use crate::complete;
+use crate::description_util::add_trailers;
 use crate::description_util::description_template;
 use crate::description_util::edit_description;
 use crate::ui::Ui;
@@ -66,7 +66,7 @@ pub(crate) struct SplitArgs {
         long, short,
         default_value = "@",
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     revision: RevisionArg,
     /// Split the revision into two parallel revisions instead of a parent and
@@ -148,9 +148,8 @@ pub(crate) fn cmd_split(
     let first_commit = {
         let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
         commit_builder.set_tree_id(target.selected_tree.id());
-        if commit_builder.description().is_empty() {
-            commit_builder.set_description(tx.settings().get_string("ui.default-description")?);
-        }
+        let new_description = add_trailers(ui, &tx, &commit_builder)?;
+        commit_builder.set_description(new_description);
         let temp_commit = commit_builder.write_hidden()?;
         let template = description_template(
             ui,
@@ -192,6 +191,8 @@ pub(crate) fn cmd_split(
             // second commit.
             "".to_string()
         } else {
+            let new_description = add_trailers(ui, &tx, &commit_builder)?;
+            commit_builder.set_description(new_description);
             let temp_commit = commit_builder.write_hidden()?;
             let template = description_template(
                 ui,

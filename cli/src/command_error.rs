@@ -51,6 +51,8 @@ use jj_lib::revset::RevsetParseError;
 use jj_lib::revset::RevsetParseErrorKind;
 use jj_lib::revset::RevsetResolutionError;
 use jj_lib::str_util::StringPatternParseError;
+use jj_lib::trailer::TrailerParseError;
+use jj_lib::transaction::TransactionCommitError;
 use jj_lib::view::RenameWorkspaceError;
 use jj_lib::working_copy::RecoverWorkspaceError;
 use jj_lib::working_copy::ResetError;
@@ -354,6 +356,7 @@ impl From<WorkspaceInitError> for CommandError {
                 internal_error_with_message("Failed to access the repository", err)
             }
             WorkspaceInitError::SignInit(err) => user_error(err),
+            WorkspaceInitError::TransactionCommit(err) => err.into(),
         }
     }
 }
@@ -408,6 +411,12 @@ impl From<ResetError> for CommandError {
     }
 }
 
+impl From<TransactionCommitError> for CommandError {
+    fn from(err: TransactionCommitError) -> Self {
+        internal_error(err)
+    }
+}
+
 impl From<DiffEditError> for CommandError {
     fn from(err: DiffEditError) -> Self {
         user_error_with_message("Failed to edit diff", err)
@@ -431,7 +440,17 @@ impl From<ConflictResolveError> for CommandError {
         match err {
             ConflictResolveError::Backend(err) => err.into(),
             ConflictResolveError::Io(err) => err.into(),
-            _ => user_error_with_message("Failed to resolve conflicts", err),
+            _ => {
+                let hint = match &err {
+                    ConflictResolveError::ExecutableConflict { .. } => {
+                        Some("Use `jj file chmod` to update the executable bit.".to_owned())
+                    }
+                    _ => None,
+                };
+                let mut cmd_err = user_error_with_message("Failed to resolve conflicts", err);
+                cmd_err.extend_hints(hint);
+                cmd_err
+            }
         }
     }
 }
@@ -476,6 +495,12 @@ impl From<TempTextEditError> for CommandError {
         let mut cmd_err = user_error(err);
         cmd_err.extend_hints(hint);
         cmd_err
+    }
+}
+
+impl From<TrailerParseError> for CommandError {
+    fn from(err: TrailerParseError) -> Self {
+        user_error(err)
     }
 }
 
@@ -594,9 +619,9 @@ impl From<RecoverWorkspaceError> for CommandError {
     fn from(err: RecoverWorkspaceError) -> Self {
         match err {
             RecoverWorkspaceError::Backend(err) => err.into(),
-            RecoverWorkspaceError::OpHeadsStore(err) => err.into(),
             RecoverWorkspaceError::Reset(err) => err.into(),
             RecoverWorkspaceError::RewriteRootCommit(err) => err.into(),
+            RecoverWorkspaceError::TransactionCommit(err) => err.into(),
             err @ RecoverWorkspaceError::WorkspaceMissingWorkingCopy(_) => user_error(err),
         }
     }
@@ -837,7 +862,7 @@ fn revset_resolution_error_hint(err: &RevsetResolutionError) -> Option<String> {
         | RevsetResolutionError::WorkspaceMissingWorkingCopy { .. }
         | RevsetResolutionError::AmbiguousCommitIdPrefix(_)
         | RevsetResolutionError::AmbiguousChangeIdPrefix(_)
-        | RevsetResolutionError::StoreError(_)
+        | RevsetResolutionError::Backend(_)
         | RevsetResolutionError::Other(_) => None,
     }
 }

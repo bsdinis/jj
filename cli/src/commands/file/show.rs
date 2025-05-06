@@ -15,7 +15,6 @@
 use std::io;
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use jj_lib::backend::BackendResult;
 use jj_lib::conflicts::materialize_merge_result;
@@ -49,7 +48,7 @@ pub(crate) struct FileShowArgs {
         long, short,
         default_value = "@",
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::all_revisions),
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     revision: RevisionArg,
     /// Paths to print
@@ -133,9 +132,9 @@ fn write_tree_entries<P: AsRef<RepoPath>>(
             MaterializedTreeValue::File(mut file) => {
                 io::copy(&mut file.reader, &mut ui.stdout_formatter().as_mut())?;
             }
-            MaterializedTreeValue::FileConflict { contents, .. } => {
+            MaterializedTreeValue::FileConflict(file) => {
                 materialize_merge_result(
-                    &contents,
+                    &file.contents,
                     workspace_command.env().conflict_marker_style(),
                     &mut ui.stdout_formatter(),
                 )?;

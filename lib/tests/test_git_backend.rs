@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -33,11 +32,15 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::store::Store;
 use jj_lib::transaction::Transaction;
+use maplit::hashmap;
 use maplit::hashset;
 use testutils::commit_with_tree;
 use testutils::create_random_commit;
 use testutils::create_single_tree;
 use testutils::create_tree;
+use testutils::is_external_tool_installed;
+use testutils::repo_path;
+use testutils::repo_path_buf;
 use testutils::CommitGraphBuilder;
 use testutils::TestRepo;
 use testutils::TestRepoBackend;
@@ -93,7 +96,7 @@ fn make_commit(
 #[test]
 fn test_gc() {
     // TODO: Better way to disable the test if git command couldn't be executed
-    if Command::new("git").arg("--version").status().is_err() {
+    if !is_external_tool_installed("git") {
         eprintln!("Skipping because git command might fail to run");
         return;
     }
@@ -244,9 +247,9 @@ fn test_copy_detection() {
     let repo = &test_repo.repo;
 
     let paths = &[
-        RepoPathBuf::from_internal_string("file0"),
-        RepoPathBuf::from_internal_string("file1"),
-        RepoPathBuf::from_internal_string("file2"),
+        repo_path_buf("file0"),
+        repo_path_buf("file1"),
+        repo_path_buf("file2"),
     ];
 
     let mut tx = repo.start_transaction();
@@ -294,14 +297,52 @@ fn test_copy_detection() {
 }
 
 #[test]
+fn test_copy_detection_file_and_dir() {
+    let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let repo = &test_repo.repo;
+
+    // a -> b (file)
+    // b -> a (dir)
+    // c -> c/file (file)
+    let mut tx = repo.start_transaction();
+    let commit_a = make_commit(
+        &mut tx,
+        vec![repo.store().root_commit_id().clone()],
+        &[
+            (repo_path("a"), "content1"),
+            (repo_path("b/file"), "content2"),
+            (repo_path("c"), "content3"),
+        ],
+    );
+    let commit_b = make_commit(
+        &mut tx,
+        vec![commit_a.id().clone()],
+        &[
+            (repo_path("a/file"), "content2"),
+            (repo_path("b"), "content1"),
+            (repo_path("c/file"), "content3"),
+        ],
+    );
+
+    assert_eq!(
+        get_copy_records(repo.store(), None, &commit_a, &commit_b),
+        hashmap! {
+            "b".to_owned() => "a".to_owned(),
+            "a/file".to_owned() => "b/file".to_owned(),
+            "c/file".to_owned() => "c".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn test_jj_trees_header_with_one_tree() {
     let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
     let repo = test_repo.repo;
     let git_backend = get_git_backend(&repo);
     let git_repo = git_backend.git_repo();
 
-    let tree_1 = create_single_tree(&repo, &[(RepoPath::from_internal_string("file"), "aaa")]);
-    let tree_2 = create_single_tree(&repo, &[(RepoPath::from_internal_string("file"), "bbb")]);
+    let tree_1 = create_single_tree(&repo, &[(repo_path("file"), "aaa")]);
+    let tree_2 = create_single_tree(&repo, &[(repo_path("file"), "bbb")]);
 
     // Create a normal commit with tree 1
     let commit = commit_with_tree(

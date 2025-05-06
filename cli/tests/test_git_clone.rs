@@ -15,6 +15,8 @@
 use std::path;
 
 use indoc::formatdoc;
+use indoc::indoc;
+use test_case::test_case;
 use testutils::git;
 
 use crate::common::to_toml_value;
@@ -866,6 +868,40 @@ fn test_git_clone_malformed() {
     Parent commit (@-): zzzzzzzz 00000000 (empty) (no description set)
     [EOF]
     ");
+}
+
+fn test_git_clone_with_global_git_remote_config() {
+    let mut test_env = TestEnvironment::default();
+    test_env.work_dir("").write_file(
+        "git-config",
+        indoc! {r#"
+            [remote "origin"]
+                prune = true
+        "#},
+    );
+    test_env.add_env_var(
+        "GIT_CONFIG_GLOBAL",
+        test_env.env_root().join("git-config").to_str().unwrap(),
+    );
+
+    let root_dir = test_env.work_dir("");
+    let git_repo_path = root_dir.root().join("source");
+    let git_repo = git::init(git_repo_path);
+    set_up_non_empty_git_repo(&git_repo);
+
+    let output = root_dir.run_jj(["git", "clone", "source", "clone"]);
+    insta::allow_duplicates! {
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching into new repo in "$TEST_ENV/clone"
+    bookmark: main@origin [new] untracked
+    Setting the revset alias `trunk()` to `main@origin`
+    Working copy  (@) now at: sqpuoqvx 2ca1c979 (empty) (no description set)
+    Parent commit (@-)      : qomsplrm ebeb70d8 main | message
+    Added 1 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    }
 }
 
 #[test]

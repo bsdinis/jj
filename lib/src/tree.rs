@@ -22,7 +22,6 @@ use std::hash::Hasher;
 use std::io::Read as _;
 use std::sync::Arc;
 
-use futures::future::try_join_all;
 use itertools::Itertools as _;
 use tracing::instrument;
 
@@ -31,13 +30,11 @@ use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::ConflictId;
 use crate::backend::TreeEntriesNonRecursiveIterator;
-use crate::backend::TreeEntry;
 use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::files;
 use crate::matchers::EverythingMatcher;
 use crate::matchers::Matcher;
-use crate::merge::Merge;
 use crate::merge::MergedTreeVal;
 use crate::object_id::ObjectId as _;
 use crate::repo_path::RepoPath;
@@ -117,19 +114,11 @@ impl Tree {
         self.data.entries()
     }
 
-    pub fn entries(&self) -> TreeEntriesIterator<'static> {
-        TreeEntriesIterator::new(self.clone(), &EverythingMatcher)
-    }
-
     pub fn entries_matching<'matcher>(
         &self,
         matcher: &'matcher dyn Matcher,
     ) -> TreeEntriesIterator<'matcher> {
         TreeEntriesIterator::new(self.clone(), matcher)
-    }
-
-    pub fn entry(&self, basename: &RepoPathComponent) -> Option<TreeEntry> {
-        self.data.entry(basename)
     }
 
     pub fn value(&self, basename: &RepoPathComponent) -> Option<&TreeValue> {
@@ -278,15 +267,15 @@ pub async fn try_resolve_file_conflict(
     // merge it. We check early so we don't waste time reading file contents if
     // we can't merge them anyway. At the same time we determine whether the
     // resulting file should be executable.
-    let Some(file_id_conflict) = conflict.maybe_map(|term| match term {
-        Some(TreeValue::File { id, executable: _ }) => Some(id),
-        _ => None,
+    let Ok(file_id_conflict) = conflict.try_map(|term| match term {
+        Some(TreeValue::File { id, executable: _ }) => Ok(id),
+        _ => Err(()),
     }) else {
         return Ok(None);
     };
-    let Some(executable_conflict) = conflict.maybe_map(|term| match term {
-        Some(TreeValue::File { id: _, executable }) => Some(executable),
-        _ => None,
+    let Ok(executable_conflict) = conflict.try_map(|term| match term {
+        Some(TreeValue::File { id: _, executable }) => Ok(executable),
+        _ => Err(()),
     }) else {
         return Ok(None);
     };
@@ -311,19 +300,20 @@ pub async fn try_resolve_file_conflict(
     //    cannot
     let file_id_conflict = file_id_conflict.simplify();
 
-    let content_futures = file_id_conflict.into_iter().map(|file_id| async {
-        let mut content = vec![];
-        let mut reader = store.read_file_async(filename, file_id).await?;
-        reader
-            .read_to_end(&mut content)
-            .map_err(|err| BackendError::ReadObject {
-                object_type: file_id.object_type(),
-                hash: file_id.hex(),
-                source: err.into(),
-            })?;
-        BackendResult::Ok(content)
-    });
-    let contents = Merge::from_vec(try_join_all(content_futures).await?);
+    let contents = file_id_conflict
+        .try_map_async(|file_id| async {
+            let mut content = vec![];
+            let mut reader = store.read_file_async(filename, file_id).await?;
+            reader
+                .read_to_end(&mut content)
+                .map_err(|err| BackendError::ReadObject {
+                    object_type: file_id.object_type(),
+                    hash: file_id.hex(),
+                    source: err.into(),
+                })?;
+            BackendResult::Ok(content)
+        })
+        .await?;
     if let Some(merged_content) = files::try_merge(&contents) {
         let id = store
             .write_file(filename, &mut merged_content.as_slice())

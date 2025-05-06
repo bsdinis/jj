@@ -115,13 +115,16 @@ directory](https://github.com/jj-vcs/jj/tree/main/cli/src/commands). Working
 on them requires setting up a Rust development environment, as described
 below, and may occasionally require adjusting a test.
 
-
 ## Learning Rust
 
 In addition to the [Rust Book](https://doc.rust-lang.org/book/) and the other
 excellent resources at <https://www.rust-lang.org/learn>, we recommend the
 ["Comprehensive Rust" mini-course](https://google.github.io/comprehensive-rust/)
 for an overview, especially if you are familiar with C++.
+
+## Style guide
+
+See [here](style_guide.md).
 
 ## Setting up a development environment
 
@@ -299,7 +302,7 @@ version and the dependencies needed to build the docs. Install it like so:
 
 === "macOS/Linux"
 
-    ``` { .shell .copy }
+    ```shell
     curl -LsSf https://astral.sh/uv/install.sh | sh
     ```
 
@@ -307,25 +310,25 @@ version and the dependencies needed to build the docs. Install it like so:
         If you don't have `~/.local/bin` in your `PATH`, the installer will
         modify your shell profile. To avoid it:
 
-        ``` { .shell .copy }
+        ```shell
         curl -LsSf https://astral.sh/uv/install.sh | env INSTALLER_NO_MODIFY_PATH=1 sh
         ```
 
 === "Windows"
 
-    ``` { .shell .copy }
+    ```shell
     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
     ```
 
 === "Homebrew"
 
-    ``` { .shell .copy }
+    ```shell
     brew install uv
     ```
 
 === "Cargo"
 
-    ``` { .shell .copy }
+    ```shell
     # This might take a while
     cargo install --git https://github.com/astral-sh/uv uv
     ```
@@ -337,9 +340,9 @@ version and the dependencies needed to build the docs. Install it like so:
 
 ### Build the docs
 
-To build the docs, run from the root of the `jj` repository:
+To build the docs, run while inside the `jj` repository:
 
-``` { .shell .copy }
+```shell
 uv run mkdocs serve
 ```
 
@@ -352,6 +355,15 @@ reloaded in your browser automatically.
     Check the terminal from which you ran `uv run mkdocs serve` for any build
     errors or warnings. Warnings about `"GET /versions.json HTTP/1.1" code 404`
     are expected and harmless.
+
+#### Offline distribution
+
+To build the rendered docs for offline distribution or to view them from your file
+system, run while inside the `jj` repository:
+
+```shell
+MKDOCS_OFFLINE=true uv run mkdocs build
+```
 
 ## Building the entire website
 

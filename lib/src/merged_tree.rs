@@ -30,9 +30,7 @@ use std::vec;
 use either::Either;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use futures::stream::StreamExt as _;
 use futures::Stream;
-use futures::TryStreamExt as _;
 use itertools::EitherOrBoth;
 use itertools::Itertools as _;
 use pollster::FutureExt as _;
@@ -161,7 +159,7 @@ impl MergedTree {
     /// Tries to resolve any conflicts, resolving any conflicts that can be
     /// automatically resolved and leaving the rest unresolved.
     pub fn resolve(&self) -> BackendResult<MergedTree> {
-        let merged = merge_trees(&self.trees)?;
+        let merged = merge_trees(&self.trees).block_on()?;
         // If the result can be resolved, then `merge_trees()` above would have returned
         // a resolved merge. However, that function will always preserve the arity of
         // conflicts it cannot resolve. So we simplify the conflict again
@@ -171,7 +169,7 @@ impl MergedTree {
         // particular,  that this last simplification doesn't enable further automatic
         // resolutions
         if cfg!(debug_assertions) {
-            let re_merged = merge_trees(&simplified).unwrap();
+            let re_merged = merge_trees(&simplified).block_on().unwrap();
             debug_assert_eq!(re_merged, simplified);
         }
         Ok(MergedTree { trees: simplified })
@@ -440,7 +438,7 @@ fn trees_value<'a>(trees: &'a Merge<Tree>, basename: &RepoPathComponent) -> Merg
 
 /// The returned conflict will either be resolved or have the same number of
 /// sides as the input.
-fn merge_trees(merge: &Merge<Tree>) -> BackendResult<Merge<Tree>> {
+async fn merge_trees(merge: &Merge<Tree>) -> BackendResult<Merge<Tree>> {
     if let Some(tree) = merge.resolve_trivial() {
         return Ok(Merge::resolved(tree.clone()));
     }
@@ -456,7 +454,7 @@ fn merge_trees(merge: &Merge<Tree>) -> BackendResult<Merge<Tree>> {
     // TODO: Merge values concurrently
     for (basename, path_merge) in all_merged_tree_entries(merge) {
         let path = dir.join(basename);
-        let path_merge = merge_tree_values(store, &path, &path_merge).block_on()?;
+        let path_merge = merge_tree_values(store, &path, &path_merge).await?;
         match path_merge.into_resolved() {
             Ok(value) => {
                 new_tree.set_or_remove(basename, value);
@@ -467,7 +465,7 @@ fn merge_trees(merge: &Merge<Tree>) -> BackendResult<Merge<Tree>> {
         };
     }
     if conflicts.is_empty() {
-        let new_tree_id = store.write_tree(dir, new_tree).block_on()?;
+        let new_tree_id = store.write_tree(dir, new_tree).await?;
         Ok(Merge::resolved(new_tree_id))
     } else {
         // For each side of the conflict, overwrite the entries in `new_tree` with the
@@ -479,7 +477,7 @@ fn merge_trees(merge: &Merge<Tree>) -> BackendResult<Merge<Tree>> {
             for (basename, path_conflict) in &mut conflicts {
                 new_tree.set_or_remove(basename, path_conflict.next().unwrap());
             }
-            let tree = store.write_tree(dir, new_tree.clone()).block_on()?;
+            let tree = store.write_tree(dir, new_tree.clone()).await?;
             new_trees.push(tree);
         }
         Ok(Merge::from_vec(new_trees))
@@ -499,11 +497,11 @@ async fn merge_tree_values(
         return Ok(Merge::resolved(resolved.cloned()));
     }
 
-    if let Some(trees) = values.to_tree_merge(store, path)? {
+    if let Some(trees) = values.to_tree_merge(store, path).await? {
         // If all sides are trees or missing, merge the trees recursively, treating
         // missing trees as empty.
         let empty_tree_id = store.empty_tree_id();
-        let merged_tree = merge_trees(&trees)?;
+        let merged_tree = Box::pin(merge_trees(&trees)).await?;
         Ok(merged_tree
             .map(|tree| (tree.id() != empty_tree_id).then(|| TreeValue::Tree(tree.id().clone()))))
     } else {
@@ -596,7 +594,7 @@ impl Iterator for TreeEntriesIterator<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(top) = self.stack.last_mut() {
             if let Some((path, value)) = top.entries.pop() {
-                let maybe_trees = match value.to_tree_merge(&self.store, &path) {
+                let maybe_trees = match value.to_tree_merge(&self.store, &path).block_on() {
                     Ok(maybe_trees) => maybe_trees,
                     Err(err) => return Some((path, Err(err))),
                 };
@@ -658,7 +656,7 @@ impl Iterator for ConflictIterator {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(top) = self.stack.last_mut() {
             if let Some((path, tree_values)) = top.entries.pop() {
-                match tree_values.to_tree_merge(&self.store, &path) {
+                match tree_values.to_tree_merge(&self.store, &path).block_on() {
                     Ok(Some(trees)) => {
                         // If all sides are trees or missing, descend into the merged tree
                         self.stack.push(ConflictsDirItem::from(&trees));
@@ -725,7 +723,7 @@ impl<'matcher> TreeDiffIterator<'matcher> {
         dir: &RepoPath,
         values: &MergedTreeValue,
     ) -> BackendResult<Merge<Tree>> {
-        if let Some(trees) = values.to_tree_merge(store, dir)? {
+        if let Some(trees) = values.to_tree_merge(store, dir).block_on()? {
             Ok(trees)
         } else {
             Ok(Merge::resolved(Tree::empty(store.clone(), dir.to_owned())))
@@ -960,11 +958,9 @@ impl<'matcher> TreeDiffStreamImpl<'matcher> {
         values: MergedTreeValue,
     ) -> BackendResult<Merge<Tree>> {
         if values.is_tree() {
-            let builder: MergeBuilder<Tree> = futures::stream::iter(values.iter())
-                .then(|value| Self::single_tree(&store, dir.clone(), value.as_ref()))
-                .try_collect()
-                .await?;
-            Ok(builder.build())
+            values
+                .try_map_async(|value| Self::single_tree(&store, dir.clone(), value.as_ref()))
+                .await
         } else {
             Ok(Merge::resolved(Tree::empty(store, dir)))
         }

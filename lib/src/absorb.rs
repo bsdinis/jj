@@ -25,7 +25,7 @@ use futures::StreamExt as _;
 use itertools::Itertools as _;
 use thiserror::Error;
 
-use crate::annotate::get_annotation_with_file_content;
+use crate::annotate::FileAnnotator;
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::CommitId;
@@ -117,17 +117,9 @@ pub async fn split_hunks_to_trees(
                 continue;
             }
         };
-        let right_text = match to_file_value(right_value) {
-            Ok(Some(mut value)) => value.read_all(right_path)?,
-            // Deleted file could be absorbed, but that would require special
-            // handling to propagate deletion of the tree entry
-            Ok(None) => {
-                let reason = "Deleted file".to_owned();
-                selected_trees
-                    .skipped_paths
-                    .push((right_path.to_owned(), reason));
-                continue;
-            }
+        let (right_text, deleted) = match to_file_value(right_value) {
+            Ok(Some(mut value)) => (value.read_all(right_path)?, false),
+            Ok(None) => (vec![], true),
             Err(reason) => {
                 selected_trees
                     .skipped_paths
@@ -137,13 +129,10 @@ pub async fn split_hunks_to_trees(
         };
 
         // Compute annotation of parent (= left) content to map right hunks
-        let annotation = get_annotation_with_file_content(
-            repo,
-            source.commit.id(),
-            destinations,
-            left_path,
-            left_text.clone(),
-        )?;
+        let mut annotator =
+            FileAnnotator::with_file_content(source.commit.id(), left_path, left_text.clone());
+        annotator.compute(repo, destinations)?;
+        let annotation = annotator.to_annotation();
         let annotation_ranges = annotation
             .compact_line_ranges()
             .filter_map(|(commit_id, range)| Some((commit_id.ok()?, range)))
@@ -157,14 +146,19 @@ pub async fn split_hunks_to_trees(
                 .entry(commit_id.clone())
                 .or_insert_with(|| MergedTreeBuilder::new(left_tree.id().clone()));
             let new_text = combine_texts(&left_text, &right_text, ranges);
-            let id = repo
-                .store()
-                .write_file(left_path, &mut new_text.as_slice())
-                .await?;
-            tree_builder.set_or_remove(
-                left_path.to_owned(),
-                Merge::normal(TreeValue::File { id, executable }),
-            );
+            // Since changes to be absorbed are represented as diffs relative to
+            // the source parent, we can propagate file deletion only if the
+            // whole file content is deleted at a single destination commit.
+            let new_tree_value = if new_text.is_empty() && deleted {
+                Merge::absent()
+            } else {
+                let id = repo
+                    .store()
+                    .write_file(left_path, &mut new_text.as_slice())
+                    .await?;
+                Merge::normal(TreeValue::File { id, executable })
+            };
+            tree_builder.set_or_remove(left_path.to_owned(), new_tree_value);
         }
     }
 
@@ -338,8 +332,9 @@ fn to_file_value(value: MaterializedTreeValue) -> Result<Option<MaterializedFile
         MaterializedTreeValue::AccessDenied(err) => Err(format!("Access is denied: {err}")),
         MaterializedTreeValue::File(file) => Ok(Some(file)),
         MaterializedTreeValue::Symlink { .. } => Err("Is a symlink".into()),
-        MaterializedTreeValue::FileConflict { .. }
-        | MaterializedTreeValue::OtherConflict { .. } => Err("Is a conflict".into()),
+        MaterializedTreeValue::FileConflict(_) | MaterializedTreeValue::OtherConflict { .. } => {
+            Err("Is a conflict".into())
+        }
         MaterializedTreeValue::GitSubmodule(_) => Err("Is a Git submodule".into()),
         MaterializedTreeValue::Tree(_) => panic!("diff should not contain trees"),
     }

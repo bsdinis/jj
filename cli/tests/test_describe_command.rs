@@ -149,7 +149,7 @@ fn test_describe() {
     insta::with_settings!({
         filters => [
             (r"\bEditor '[^']*'", "Editor '<redacted>'"),
-            (r"\b(editor-)[^.]*(\.jjdescription)\b", "$1<redacted>$2"),
+            (r"in .*(editor-)[^.]*(\.jjdescription)\b", "in <redacted>$1<redacted>$2"),
             ("exit code", "exit status"), // Windows
         ],
     }, {
@@ -157,7 +157,7 @@ fn test_describe() {
         ------- stderr -------
         Error: Failed to edit description
         Caused by: Editor '<redacted>' exited with exit status: 1
-        Hint: Edited description is left in $TEST_ENV/repo/.jj/repo/editor-<redacted>.jjdescription
+        Hint: Edited description is left in <redacted>editor-<redacted>.jjdescription
         [EOF]
         [exit status: 1]
         ");
@@ -481,7 +481,7 @@ fn test_describe_multiple_commits() {
     insta::with_settings!({
         filters => [
             (r"\bEditor '[^']*'", "Editor '<redacted>'"),
-            (r"\b(editor-)[^.]*(\.jjdescription)\b", "$1<redacted>$2"),
+            (r"in .*(editor-)[^.]*(\.jjdescription)\b", "in <redacted>$1<redacted>$2"),
             ("exit code", "exit status"), // Windows
         ],
     }, {
@@ -489,7 +489,7 @@ fn test_describe_multiple_commits() {
         ------- stderr -------
         Error: Failed to edit description
         Caused by: Editor '<redacted>' exited with exit status: 1
-        Hint: Edited description is left in $TEST_ENV/repo/.jj/repo/editor-<redacted>.jjdescription
+        Hint: Edited description is left in <redacted>editor-<redacted>.jjdescription
         [EOF]
         [exit status: 1]
         ");
@@ -616,12 +616,13 @@ fn test_describe_default_description() {
     work_dir.write_file("file2", "bar\n");
     std::fs::write(edit_script, ["dump editor"].join("\0")).unwrap();
     let output = work_dir.run_jj(["describe"]);
-    insta::assert_snapshot!(output, @r"
+    insta::assert_snapshot!(output, @r#"
     ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
     Working copy  (@) now at: qpvuntsm 573b6df5 TESTED=TODO
     Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
     [EOF]
-    ");
+    "#);
     insta::assert_snapshot!(
         std::fs::read_to_string(test_env.env_root().join("editor")).unwrap(), @r#"
     TESTED=TODO
@@ -636,12 +637,13 @@ fn test_describe_default_description() {
     // Default description shouldn't be used if --no-edit
     work_dir.run_jj(["new", "root()"]).success();
     let output = work_dir.run_jj(["describe", "--no-edit", "--reset-author"]);
-    insta::assert_snapshot!(output, @r"
+    insta::assert_snapshot!(output, @r#"
     ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
     Working copy  (@) now at: kkmpptxz f652c321 (empty) (no description set)
     Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
     [EOF]
-    ");
+    "#);
 }
 
 #[test]
@@ -906,6 +908,222 @@ fn test_edit_cannot_be_used_with_no_edit() {
     [EOF]
     [exit status: 2]
     ");
+}
+
+#[test]
+fn test_add_trailer() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // Set a description using `-m` flag
+    let output = work_dir.run_jj([
+        "describe",
+        "-m",
+        "Message from CLI",
+        "--config",
+        r#"templates.commit_trailers='"Signed-off-by: " ++ committer'"#,
+    ]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Working copy  (@) now at: qpvuntsm f576838d (empty) Message from CLI
+    Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["log", "--no-graph", "-r@", "-Tdescription"]);
+    insta::assert_snapshot!(output, @r"
+    Message from CLI
+
+    Signed-off-by: Test User <test.user@example.com>
+    [EOF]
+    ");
+
+    // multiple trailers may be used, and work with --no-edit
+    let output = work_dir.run_jj([
+        "describe",
+        "--no-edit",
+        "--config",
+        r#"templates.commit_trailers='"CC: alice@example.com\nChange-Id: I6a6a6964" ++ self.change_id().normal_hex()'"#,
+    ]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Working copy  (@) now at: qpvuntsm 2d3438dc (empty) Message from CLI
+    Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["log", "--no-graph", "-r@", "-Tdescription"]);
+    insta::assert_snapshot!(output, @r"
+    Message from CLI
+
+    Signed-off-by: Test User <test.user@example.com>
+    CC: alice@example.com
+    Change-Id: I6a6a69649a45c67d3e96a7e5007c110ede34dec5
+    [EOF]
+    ");
+
+    // it won't create a duplicate entry
+    let output = work_dir.run_jj([
+        "describe",
+        "--no-edit",
+        "--config",
+        r#"templates.commit_trailers='"CC: alice@example.com"'"#,
+    ]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Nothing changed.
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["log", "--no-graph", "-r@", "-Tdescription"]);
+    insta::assert_snapshot!(output, @r"
+    Message from CLI
+
+    Signed-off-by: Test User <test.user@example.com>
+    CC: alice@example.com
+    Change-Id: I6a6a69649a45c67d3e96a7e5007c110ede34dec5
+    [EOF]
+    ");
+
+    // invalid generated trailers generate an error
+    let output = work_dir.run_jj([
+        "describe",
+        "--no-edit",
+        "--config",
+        r#"templates.commit_trailers='"this is an invalid trailer"'"#,
+    ]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Error: Invalid trailer line: this is an invalid trailer
+    [EOF]
+    [exit status: 1]
+    ");
+
+    // it doesn't modify a commit with an empty description
+    let output = work_dir.run_jj(["new"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Working copy  (@) now at: yostqsxw 5a8ea7e1 (empty) (no description set)
+    Parent commit (@-)      : qpvuntsm 2d3438dc (empty) Message from CLI
+    [EOF]
+    ");
+    let output = work_dir.run_jj([
+        "describe",
+        "--no-edit",
+        "--config",
+        r#"templates.commit_trailers='"CC: alice@example.com"'"#,
+    ]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Nothing changed.
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_add_trailer_committer() {
+    let mut test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let edit_script = test_env.set_up_fake_editor();
+    let work_dir = test_env.work_dir("repo");
+    test_env.add_config(
+        r#"[templates]
+        commit_trailers = '''"Signed-off-by: " ++ committer.email()'''"#,
+    );
+
+    let output = work_dir.run_jj(["describe", "-m", "Message from CLI"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Working copy  (@) now at: qpvuntsm 500b5e31 (empty) Message from CLI
+    Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["log", "--no-graph", "-r@", "-Tdescription"]);
+    insta::assert_snapshot!(output, @r"
+    Message from CLI
+
+    Signed-off-by: test.user@example.com
+    [EOF]
+    ");
+
+    // committer is properly set in the trailer
+    let output = work_dir.run_jj([
+        "describe",
+        "--no-edit",
+        "--config",
+        "user.email=foo@bar.org",
+    ]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Working copy  (@) now at: qpvuntsm b71fc9e2 (empty) Message from CLI
+    Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["log", "--no-graph", "-r@", "-Tdescription"]);
+    insta::assert_snapshot!(output, @r"
+    Message from CLI
+
+    Signed-off-by: test.user@example.com
+    Signed-off-by: foo@bar.org
+    [EOF]
+    ");
+
+    // trailer is added with the expected committer in the editor
+    std::fs::write(&edit_script, "dump editor0").unwrap();
+    let output = work_dir.run_jj(["describe", "--config", "user.email=foo@bar.net"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Working copy  (@) now at: qpvuntsm d430eef5 (empty) Message from CLI
+    Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+    [EOF]
+    ");
+
+    insta::assert_snapshot!(
+        std::fs::read_to_string(test_env.env_root().join("editor0")).unwrap(), @r#"
+    Message from CLI
+
+    Signed-off-by: test.user@example.com
+    Signed-off-by: foo@bar.org
+    Signed-off-by: foo@bar.net
+
+    JJ: Lines starting with "JJ:" (like this one) will be removed.
+    "#);
+
+    let output = work_dir.run_jj(["log", "--no-graph", "-r@", "-Tdescription"]);
+    insta::assert_snapshot!(output, @r"
+    Message from CLI
+
+    Signed-off-by: test.user@example.com
+    Signed-off-by: foo@bar.org
+    Signed-off-by: foo@bar.net
+    [EOF]
+    ");
+
+    // trailer is added added when editing an empty description
+    work_dir.run_jj(["new"]).success();
+    std::fs::write(&edit_script, "dump editor0").unwrap();
+    let output = work_dir.run_jj(["describe"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Working copy  (@) now at: vruxwmqv bc9e914e (empty) Signed-off-by: test.user@example.com
+    Parent commit (@-)      : qpvuntsm d430eef5 (empty) Message from CLI
+    [EOF]
+    ");
+
+    let editor0 = std::fs::read_to_string(test_env.env_root().join("editor0")).unwrap();
+    insta::assert_snapshot!(
+        format!("-----\n{editor0}-----\n"), @r#"
+    -----
+
+    
+    Signed-off-by: test.user@example.com
+
+    JJ: Lines starting with "JJ:" (like this one) will be removed.
+    -----
+    "#);
 }
 
 #[must_use]

@@ -18,9 +18,9 @@ use std::rc::Rc;
 use itertools::Itertools as _;
 use jj_cli::cli_util::CliRunner;
 use jj_cli::commit_templater::CommitTemplateBuildFnTable;
-use jj_cli::commit_templater::CommitTemplateLanguage;
 use jj_cli::commit_templater::CommitTemplateLanguageExtension;
-use jj_cli::template_builder::TemplateLanguage as _;
+use jj_cli::commit_templater::CommitTemplatePropertyKind;
+use jj_cli::template_builder::CoreTemplatePropertyVar as _;
 use jj_cli::template_parser;
 use jj_cli::template_parser::TemplateParseError;
 use jj_cli::templater::TemplatePropertyExt as _;
@@ -121,7 +121,7 @@ impl SymbolResolverExtension for TheDigitest {
 
 impl CommitTemplateLanguageExtension for HexCounter {
     fn build_fn_table<'repo>(&self) -> CommitTemplateBuildFnTable<'repo> {
-        type L<'repo> = CommitTemplateLanguage<'repo>;
+        type P<'repo> = CommitTemplatePropertyKind<'repo>;
         let mut table = CommitTemplateBuildFnTable::empty();
         table.commit_methods.insert(
             "has_most_digits",
@@ -131,18 +131,17 @@ impl CommitTemplateLanguageExtension for HexCounter {
                     .cache_extension::<MostDigitsInId>()
                     .unwrap()
                     .count(language.repo());
-                Ok(L::wrap_boolean(property.map(move |commit| {
-                    num_digits_in_id(commit.id()) == most_digits
-                })))
+                let out_property =
+                    property.map(move |commit| num_digits_in_id(commit.id()) == most_digits);
+                Ok(P::wrap_boolean(out_property.into_dyn()))
             },
         );
         table.commit_methods.insert(
             "num_digits_in_id",
             |_language, _diagnostics, _build_context, property, call| {
                 call.expect_no_arguments()?;
-                Ok(L::wrap_integer(
-                    property.map(|commit| num_digits_in_id(commit.id())),
-                ))
+                let out_property = property.map(|commit| num_digits_in_id(commit.id()));
+                Ok(P::wrap_integer(out_property.into_dyn()))
             },
         );
         table.commit_methods.insert(
@@ -161,9 +160,8 @@ impl CommitTemplateLanguageExtension for HexCounter {
                         }
                     })?;
 
-                Ok(L::wrap_integer(
-                    property.map(move |commit| num_char_in_id(commit, char_arg)),
-                ))
+                let out_property = property.map(move |commit| num_char_in_id(commit, char_arg));
+                Ok(P::wrap_integer(out_property.into_dyn()))
             },
         );
 

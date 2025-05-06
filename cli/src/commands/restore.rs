@@ -14,7 +14,6 @@
 
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use indoc::formatdoc;
 use itertools::Itertools as _;
@@ -58,7 +57,7 @@ pub(crate) struct RestoreArgs {
         long,
         short,
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::all_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     from: Option<RevisionArg>,
     /// Revision to restore into (destination)
@@ -66,7 +65,7 @@ pub(crate) struct RestoreArgs {
         long, short = 't',
         visible_alias = "to",
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     into: Option<RevisionArg>,
     /// Undo the changes in a revision as compared to the merge of its parents.
@@ -81,7 +80,7 @@ pub(crate) struct RestoreArgs {
         long, short,
         value_name = "REVSET",
         conflicts_with_all = ["into", "from"],
-        add = ArgValueCandidates::new(complete::all_revisions),
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     changes_in: Option<RevisionArg>,
     /// Prints an error. DO NOT USE.
@@ -161,12 +160,11 @@ pub(crate) fn cmd_restore(
         writeln!(ui.status(), "Nothing changed.")?;
     } else {
         let mut tx = workspace_command.start_transaction();
-        let new_commit = tx
-            .repo_mut()
+        tx.repo_mut()
             .rewrite_commit(&to_commit)
             .set_tree_id(new_tree_id)
             .write()?;
-        // rebase_descendants early; otherwise `new_commit` would always have
+        // rebase_descendants early; otherwise the new commit would always have
         // a conflicted change id at this point.
         let (num_rebased, extra_msg) = if args.restore_descendants {
             (
@@ -177,9 +175,6 @@ pub(crate) fn cmd_restore(
             (tx.repo_mut().rebase_descendants()?, "")
         };
         if let Some(mut formatter) = ui.status_formatter() {
-            write!(formatter, "Created ")?;
-            tx.write_commit_summary(formatter.as_mut(), &new_commit)?;
-            writeln!(formatter)?;
             if num_rebased > 0 {
                 writeln!(
                     formatter,

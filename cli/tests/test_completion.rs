@@ -12,8 +12,123 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ffi::OsStr;
+
+use clap_complete::Shell;
+use itertools::Itertools as _;
+use test_case::test_case;
+
+use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+
+impl TestEnvironment {
+    /// Runs `jj` as if shell completion had been triggered for the argument of
+    /// the given index.
+    #[must_use = "either snapshot the output or assert the exit status with .success()"]
+    fn complete_at<I>(&self, shell: Shell, index: usize, args: I) -> CommandOutput
+    where
+        I: IntoIterator,
+        I::IntoIter: ExactSizeIterator,
+        I::Item: AsRef<OsStr>,
+    {
+        self.work_dir("").complete_at(shell, index, args)
+    }
+
+    /// Run `jj` as if fish shell completion had been triggered at the last item
+    /// in `args`.
+    #[must_use = "either snapshot the output or assert the exit status with .success()"]
+    fn complete_fish<I>(&self, args: I) -> CommandOutput
+    where
+        I: IntoIterator,
+        I::IntoIter: ExactSizeIterator,
+        I::Item: AsRef<OsStr>,
+    {
+        self.work_dir("").complete_fish(args)
+    }
+}
+
+impl TestWorkDir<'_> {
+    /// Runs `jj` as if shell completion had been triggered for the argument of
+    /// the given index.
+    #[must_use = "either snapshot the output or assert the exit status with .success()"]
+    fn complete_at<I>(&self, shell: Shell, index: usize, args: I) -> CommandOutput
+    where
+        I: IntoIterator,
+        I::IntoIter: ExactSizeIterator,
+        I::Item: AsRef<OsStr>,
+    {
+        let args = args.into_iter();
+        assert!(
+            index <= args.len(),
+            "index out of bounds: append empty string to complete after the last argument"
+        );
+        self.run_jj_with(|cmd| {
+            let cmd = cmd.env("COMPLETE", shell.to_string()).args(["--", "jj"]);
+
+            match shell {
+                // Bash passes the whole command line except for intermediate empty tokens but
+                // preserves trailing empty tokens:
+                // `jj log <CURSOR>`            => ["--", "jj", "log", ""]
+                //                                 with _CLAP_COMPLETE_INDEX=2
+                // `jj log <CURSOR> --no-graph` => ["--", "jj", "log", "--no-graph"]
+                //                                 with _CLAP_COMPLETE_INDEX=2
+                // `jj log --no-graph<CURSOR>`  => ["--", "jj", "log", "--no-graph"]
+                //                                 with _CLAP_COMPLETE_INDEX=2
+                //                                 (indistinguishable from the above)
+                // `jj log --no-graph <CURSOR>` => ["--", "jj", "log", "--no-graph", ""]
+                //                                 with _CLAP_COMPLETE_INDEX=3
+                Shell::Bash => {
+                    cmd.env("_CLAP_COMPLETE_INDEX", index.to_string())
+                        .args(args.coalesce(|a, b| {
+                            if a.as_ref().is_empty() {
+                                Ok(b)
+                            } else {
+                                Err((a, b))
+                            }
+                        }))
+                }
+
+                // Zsh passes the whole command line except for empty tokens, including trailing
+                // empty tokens:
+                // `jj log <CURSOR>`            => ["--", "jj", "log"]
+                //                                 with _CLAP_COMPLETE_INDEX=2
+                // `jj log <CURSOR> --no-graph` => ["--", "jj", "log", "--no-graph"]
+                //                                 with _CLAP_COMPLETE_INDEX=2
+                // `jj log --no-graph<CURSOR>`  => ["--", "jj", "log", "--no-graph"]
+                //                                 with _CLAP_COMPLETE_INDEX=2
+                //                                 (indistinguishable from the above)
+                // `jj log --no-graph <CURSOR>` => ["--", "jj", "log", "--no-graph"]
+                //                                 with _CLAP_COMPLETE_INDEX=3
+                Shell::Zsh => cmd
+                    .env("_CLAP_COMPLETE_INDEX", index.to_string())
+                    .args(args.filter(|a| !a.as_ref().is_empty())),
+
+                // Fish truncates the command line at the cursor; empty tokens are preserved:
+                // `jj log <CURSOR>`            => ["--", "jj", "log", ""]
+                // `jj log <CURSOR> --no-graph` => ["--", "jj", "log", ""]
+                // `jj log --no-graph<CURSOR>`  => ["--", "jj", "log", "--no-graph"]
+                // `jj log --no-graph <CURSOR>` => ["--", "jj", "log", "--no-graph", ""]
+                Shell::Fish => cmd.args(args.take(index)),
+
+                _ => todo!("{shell} completion behavior not implemented yet"),
+            }
+        })
+    }
+
+    /// Run `jj` as if fish shell completion had been triggered at the last item
+    /// in `args`.
+    #[must_use = "either snapshot the output or assert the exit status with .success()"]
+    fn complete_fish<I>(&self, args: I) -> CommandOutput
+    where
+        I: IntoIterator,
+        I::IntoIter: ExactSizeIterator,
+        I::Item: AsRef<OsStr>,
+    {
+        let args = args.into_iter();
+        self.complete_at(Shell::Fish, args.len(), args)
+    }
+}
 
 #[test]
 fn test_bookmark_names() {
@@ -78,15 +193,12 @@ fn test_bookmark_names() {
     origin_dir.run_jj(["git", "export"]).success();
     work_dir.run_jj(["git", "fetch"]).success();
 
-    let mut test_env = test_env;
     // Every shell hook is a little different, e.g. the zsh hooks add some
     // additional environment variables. But this is irrelevant for the purpose
     // of testing our own logic, so it's fine to test a single shell only.
-    test_env.add_env_var("COMPLETE", "fish");
-    let test_env = test_env;
     let work_dir = test_env.work_dir("repo");
 
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "rename", ""]);
+    let output = work_dir.complete_fish(["bookmark", "rename", ""]);
     insta::assert_snapshot!(output, @r"
     aaa-local	x
     aaa-tracked	x
@@ -106,29 +218,21 @@ fn test_bookmark_names() {
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "rename", "a"]);
+    let output = work_dir.complete_fish(["bookmark", "rename", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-local	x
     aaa-tracked	x
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "delete", "a"]);
+    let output = work_dir.complete_fish(["bookmark", "delete", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-local	x
     aaa-tracked	x
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "forget", "a"]);
-    insta::assert_snapshot!(output, @r"
-    aaa-local	x
-    aaa-tracked	x
-    aaa-untracked
-    [EOF]
-    ");
-
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "list", "--bookmark", "a"]);
+    let output = work_dir.complete_fish(["bookmark", "forget", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-local	x
     aaa-tracked	x
@@ -136,40 +240,48 @@ fn test_bookmark_names() {
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "move", "a"]);
+    let output = work_dir.complete_fish(["bookmark", "list", "--bookmark", "a"]);
+    insta::assert_snapshot!(output, @r"
+    aaa-local	x
+    aaa-tracked	x
+    aaa-untracked
+    [EOF]
+    ");
+
+    let output = work_dir.complete_fish(["bookmark", "move", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-local	x
     aaa-tracked	x
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "set", "a"]);
+    let output = work_dir.complete_fish(["bookmark", "set", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-local	x
     aaa-tracked	x
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "track", "a"]);
+    let output = work_dir.complete_fish(["bookmark", "track", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-untracked@origin	x
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "bookmark", "untrack", "a"]);
+    let output = work_dir.complete_fish(["bookmark", "untrack", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-tracked@origin	x
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "git", "push", "-b", "a"]);
+    let output = work_dir.complete_fish(["git", "push", "-b", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-local	x
     aaa-tracked	x
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "git", "fetch", "-b", "a"]);
+    let output = work_dir.complete_fish(["git", "fetch", "-b", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa-local	x
     aaa-tracked	x
@@ -188,30 +300,17 @@ fn test_global_arg_repository_is_respected() {
         .run_jj(["bookmark", "create", "-r@", "aaa"])
         .success();
 
-    let mut test_env = test_env;
-    test_env.add_env_var("COMPLETE", "fish");
-    let test_env = test_env;
-
-    let output = test_env.run_jj_in(
-        ".",
-        [
-            "--",
-            "jj",
-            "--repository",
-            "repo",
-            "bookmark",
-            "rename",
-            "a",
-        ],
-    );
+    let output = test_env.complete_fish(["--repository", "repo", "bookmark", "rename", "a"]);
     insta::assert_snapshot!(output, @r"
     aaa	(no description set)
     [EOF]
     ");
 }
 
-#[test]
-fn test_aliases_are_resolved() {
+#[test_case(Shell::Bash; "bash")]
+#[test_case(Shell::Zsh; "zsh")]
+#[test_case(Shell::Fish; "fish")]
+fn test_aliases_are_resolved(shell: Shell) {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
@@ -222,27 +321,69 @@ fn test_aliases_are_resolved() {
 
     // user config alias
     test_env.add_config(r#"aliases.b = ["bookmark"]"#);
+    test_env.add_config(r#"aliases.rlog = ["log", "--reversed"]"#);
     // repo config alias
     work_dir
         .run_jj(["config", "set", "--repo", "aliases.b2", "['bookmark']"])
         .success();
 
-    let mut test_env = test_env;
-    test_env.add_env_var("COMPLETE", "fish");
-    let test_env = test_env;
-    let work_dir = test_env.work_dir("repo");
+    let output = work_dir.complete_at(shell, 3, ["b", "rename", "a"]);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @"aaa[EOF]");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @"aaa:(no description set)[EOF]");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            aaa	(no description set)
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
 
-    let output = work_dir.run_jj(["--", "jj", "b", "rename", "a"]);
-    insta::assert_snapshot!(output, @r"
-    aaa	(no description set)
-    [EOF]
-    ");
+    let output = work_dir.complete_at(shell, 3, ["b2", "rename", "a"]);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @"aaa[EOF]");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @"aaa:(no description set)[EOF]");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            aaa	(no description set)
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
 
-    let output = work_dir.run_jj(["--", "jj", "b2", "rename", "a"]);
-    insta::assert_snapshot!(output, @r"
-    aaa	(no description set)
-    [EOF]
-    ");
+    let output = work_dir.complete_at(shell, 2, ["rlog", "--rev"]);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @r"
+            --revisions
+            --reversed[EOF]
+            ");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @r"
+            --revisions:Which revisions to show
+            --reversed:Show revisions in the opposite order (older revisions first)[EOF]
+            ");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            --revisions	Which revisions to show
+            --reversed	Show revisions in the opposite order (older revisions first)
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
 }
 
 #[test]
@@ -265,44 +406,199 @@ fn test_completions_are_generated() {
     ");
 }
 
-#[test]
-fn test_zsh_completion() {
-    let mut test_env = TestEnvironment::default();
-    test_env.add_env_var("COMPLETE", "zsh");
+#[test_case(Shell::Bash; "bash")]
+#[test_case(Shell::Zsh; "zsh")]
+#[test_case(Shell::Fish; "fish")]
+fn test_default_command_is_resolved(shell: Shell) {
+    let test_env = TestEnvironment::default();
 
-    // ["--", "jj"]
-    //        ^^^^ index = 0
-    let complete_at = |index: usize, args: &[&str]| {
-        test_env.run_jj_with(|cmd| {
-            cmd.args(args)
-                .env("_CLAP_COMPLETE_INDEX", index.to_string())
-        })
-    };
+    let output = test_env
+        .complete_at(shell, 1, ["--"])
+        .take_stdout_n_lines(2);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @r"
+            --revisions
+            --limit
+            [EOF]
+            ");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @r"
+            --revisions:Which revisions to show
+            --limit:Limit number of revisions to show
+            [EOF]
+            ");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            --revisions	Which revisions to show
+            --limit	Limit number of revisions to show
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
+
+    test_env.add_config("ui.default-command = ['abandon']");
+    let output = test_env
+        .complete_at(shell, 1, ["--"])
+        .take_stdout_n_lines(2);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @r"
+            --retain-bookmarks
+            --restore-descendants
+            [EOF]
+            ");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @r"
+            --retain-bookmarks:Do not delete bookmarks pointing to the revisions to abandon
+            --restore-descendants:Do not modify the content of the children of the abandoned commits
+            [EOF]
+            ");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            --retain-bookmarks	Do not delete bookmarks pointing to the revisions to abandon
+            --restore-descendants	Do not modify the content of the children of the abandoned commits
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
+
+    test_env.add_config("ui.default-command = ['bookmark', 'move']");
+    let output = test_env
+        .complete_at(shell, 1, ["--"])
+        .take_stdout_n_lines(2);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @r"
+            --from
+            --to
+            [EOF]
+            ");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @r"
+            --from:Move bookmarks from the given revisions
+            --to:Move bookmarks to this revision
+            [EOF]
+            ");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            --from	Move bookmarks from the given revisions
+            --to	Move bookmarks to this revision
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
+}
+
+#[test_case(Shell::Bash; "bash")]
+#[test_case(Shell::Zsh; "zsh")]
+#[test_case(Shell::Fish; "fish")]
+fn test_command_completion(shell: Shell) {
+    let test_env = TestEnvironment::default();
 
     // Command names should be suggested. If the default command were expanded,
     // only "log" would be listed.
-    let output = complete_at(1, &["--", "jj"]);
-    insta::assert_snapshot!(
-        output.normalize_stdout_with(|s| s.split_inclusive('\n').take(2).collect()), @r"
-    abandon:Abandon a revision
-    absorb:Move changes from a revision into the stack of mutable revisions
-    [EOF]
-    ");
-    let output = complete_at(2, &["--", "jj", "--no-pager"]);
-    insta::assert_snapshot!(
-        output.normalize_stdout_with(|s| s.split_inclusive('\n').take(2).collect()), @r"
-    abandon:Abandon a revision
-    absorb:Move changes from a revision into the stack of mutable revisions
-    [EOF]
-    ");
+    let output = test_env.complete_at(shell, 1, [""]).take_stdout_n_lines(2);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @r"
+            abandon
+            absorb
+            [EOF]
+            ");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @r"
+            abandon:Abandon a revision
+            absorb:Move changes from a revision into the stack of mutable revisions
+            [EOF]
+            ");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            abandon	Abandon a revision
+            absorb	Move changes from a revision into the stack of mutable revisions
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
 
-    let output = complete_at(1, &["--", "jj", "b"]);
-    insta::assert_snapshot!(output, @"bookmark:Manage bookmarks [default alias: b][EOF]");
+    let output = test_env
+        .complete_at(shell, 2, ["--no-pager", ""])
+        .take_stdout_n_lines(2);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @r"
+            abandon
+            absorb
+            [EOF]
+            ");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @r"
+            abandon:Abandon a revision
+            absorb:Move changes from a revision into the stack of mutable revisions
+            [EOF]
+            ");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            abandon	Abandon a revision
+            absorb	Move changes from a revision into the stack of mutable revisions
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
+
+    let output = test_env.complete_at(shell, 1, ["b"]);
+    match shell {
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @"bookmark:Manage bookmarks [default alias: b][EOF]");
+        }
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @"bookmark[EOF]");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            bookmark	Manage bookmarks [default alias: b]
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
+
+    let output = test_env.complete_at(shell, 1, ["aban", "-r", "@"]);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @"abandon[EOF]");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @"abandon:Abandon a revision[EOF]");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            abandon	Abandon a revision
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
 }
 
 #[test]
 fn test_remote_names() {
-    let mut test_env = TestEnvironment::default();
+    let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init"]).success();
 
     test_env
@@ -312,50 +608,51 @@ fn test_remote_names() {
         )
         .success();
 
-    test_env.add_env_var("COMPLETE", "fish");
-
-    let output = test_env.run_jj_in(".", ["--", "jj", "git", "remote", "remove", "o"]);
+    let output = test_env.complete_fish(["git", "remote", "remove", "o"]);
     insta::assert_snapshot!(output, @r"
     origin
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(".", ["--", "jj", "git", "remote", "rename", "o"]);
+    let output = test_env.complete_fish(["git", "remote", "rename", "o"]);
     insta::assert_snapshot!(output, @r"
     origin
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(".", ["--", "jj", "git", "remote", "set-url", "o"]);
+    let output = test_env.complete_fish(["git", "remote", "set-url", "o"]);
     insta::assert_snapshot!(output, @r"
     origin
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(".", ["--", "jj", "git", "push", "--remote", "o"]);
+    let output = test_env.complete_fish(["git", "push", "--remote", "o"]);
     insta::assert_snapshot!(output, @r"
     origin
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(".", ["--", "jj", "git", "fetch", "--remote", "o"]);
+    let output = test_env.complete_fish(["git", "fetch", "--remote", "o"]);
     insta::assert_snapshot!(output, @r"
     origin
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(".", ["--", "jj", "bookmark", "list", "--remote", "o"]);
+    let output = test_env.complete_fish(["bookmark", "list", "--remote", "o"]);
     insta::assert_snapshot!(output, @r"
     origin
     [EOF]
     ");
 }
 
-#[test]
-fn test_aliases_are_completed() {
+#[test_case(Shell::Bash; "bash")]
+#[test_case(Shell::Zsh; "zsh")]
+#[test_case(Shell::Fish; "fish")]
+fn test_aliases_are_completed(shell: Shell) {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
+    let repo_path = work_dir.root().to_str().unwrap();
 
     // user config alias
     test_env.add_config(r#"aliases.user-alias = ["bookmark"]"#);
@@ -370,44 +667,51 @@ fn test_aliases_are_completed() {
         ])
         .success();
 
-    let mut test_env = test_env;
-    test_env.add_env_var("COMPLETE", "fish");
-    let test_env = test_env;
-    let work_dir = test_env.work_dir("repo");
-
-    let output = work_dir.run_jj(["--", "jj", "user-al"]);
-    insta::assert_snapshot!(output, @r"
-    user-alias
-    [EOF]
-    ");
+    let output = work_dir.complete_at(shell, 1, ["user-al"]);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @"user-alias[EOF]");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @"user-alias[EOF]");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            user-alias
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
 
     // make sure --repository flag is respected
-    let output = test_env.run_jj_in(
-        ".",
-        [
-            "--",
-            "jj",
-            "--repository",
-            work_dir.root().to_str().unwrap(),
-            "repo-al",
-        ],
-    );
-    insta::assert_snapshot!(output, @r"
-    repo-alias
-    [EOF]
-    ");
+    let output = test_env.complete_at(shell, 3, ["--repository", repo_path, "repo-al"]);
+    match shell {
+        Shell::Bash => {
+            insta::assert_snapshot!(output, @"repo-alias[EOF]");
+        }
+        Shell::Zsh => {
+            insta::assert_snapshot!(output, @"repo-alias[EOF]");
+        }
+        Shell::Fish => {
+            insta::assert_snapshot!(output, @r"
+            repo-alias
+            [EOF]
+            ");
+        }
+        _ => unimplemented!("unexpected shell '{shell}'"),
+    }
 
     // cannot load aliases from --config flag
-    let output = test_env.run_jj_in(
-        ".",
-        [
-            "--",
-            "jj",
-            "--config=aliases.cli-alias=['bookmark']",
-            "cli-al",
-        ],
+    let output = test_env.complete_at(
+        shell,
+        2,
+        ["--config=aliases.cli-alias=['bookmark']", "cli-al"],
     );
-    insta::assert_snapshot!(output, @"");
+    assert!(
+        output.status.success() && output.stdout.is_empty(),
+        "completion expected to come back empty, but got: {output}"
+    );
 }
 
 #[test]
@@ -466,9 +770,6 @@ fn test_revisions() {
         .run_jj(["describe", "-m", "working_copy"])
         .success();
 
-    let mut test_env = test_env;
-    test_env.add_env_var("COMPLETE", "fish");
-    let test_env = test_env;
     let work_dir = test_env.work_dir("repo");
 
     // There are _a lot_ of commands and arguments accepting revisions.
@@ -476,7 +777,7 @@ fn test_revisions() {
     // completion function should be sufficient.
 
     // complete all revisions
-    let output = work_dir.run_jj(["--", "jj", "diff", "--from", ""]);
+    let output = work_dir.complete_fish(["diff", "--from", ""]);
     insta::assert_snapshot!(output, @r"
     immutable_bookmark	immutable
     mutable_bookmark	mutable
@@ -491,8 +792,24 @@ fn test_revisions() {
     [EOF]
     ");
 
+    // complete all revisions in a revset expression
+    let output = work_dir.complete_fish(["log", "-r", ".."]);
+    insta::assert_snapshot!(output, @r"
+    ..immutable_bookmark	immutable
+    ..mutable_bookmark	mutable
+    ..k	working_copy
+    ..y	mutable
+    ..q	immutable
+    ..zq	remote_commit
+    ..zz	(no description set)
+    ..remote_bookmark@origin	remote_commit
+    ..alias_with_newline	    roots(
+    ..siblings	@-+ ~@
+    [EOF]
+    ");
+
     // complete only mutable revisions
-    let output = work_dir.run_jj(["--", "jj", "squash", "--into", ""]);
+    let output = work_dir.complete_fish(["squash", "--into", ""]);
     insta::assert_snapshot!(output, @r"
     mutable_bookmark	mutable
     k	working_copy
@@ -503,9 +820,28 @@ fn test_revisions() {
     [EOF]
     ");
 
+    // complete only mutable revisions in a revset expression
+    let output = work_dir.complete_fish(["abandon", "y::"]);
+    insta::assert_snapshot!(output, @r"
+    y::mutable_bookmark	mutable
+    y::k	working_copy
+    y::y	mutable
+    y::zq	remote_commit
+    y::alias_with_newline	    roots(
+    y::siblings	@-+ ~@
+    [EOF]
+    ");
+
+    // complete remote bookmarks in a revset expression
+    let output = work_dir.complete_fish(["log", "-r", "remote_bookmark@"]);
+    insta::assert_snapshot!(output, @r"
+    remote_bookmark@origin	remote_commit
+    [EOF]
+    ");
+
     // complete args of the default command
     test_env.add_config("ui.default-command = 'log'");
-    let output = work_dir.run_jj(["--", "jj", "-r", ""]);
+    let output = work_dir.complete_fish(["-r", ""]);
     insta::assert_snapshot!(output, @r"
     immutable_bookmark	immutable
     mutable_bookmark	mutable
@@ -524,12 +860,12 @@ fn test_revisions() {
 
     // The name of a bookmark does not get completed, since we want to create a new
     // bookmark
-    let output = work_dir.run_jj(["--", "jj", "git", "push", "--named", ""]);
+    let output = work_dir.complete_fish(["git", "push", "--named", ""]);
     insta::assert_snapshot!(output, @"");
-    let output = work_dir.run_jj(["--", "jj", "git", "push", "--named", "a"]);
+    let output = work_dir.complete_fish(["git", "push", "--named", "a"]);
     insta::assert_snapshot!(output, @"");
 
-    let output = work_dir.run_jj(["--", "jj", "git", "push", "--named", "a="]);
+    let output = work_dir.complete_fish(["git", "push", "--named", "a="]);
     insta::assert_snapshot!(output, @r"
     a=immutable_bookmark	immutable
     a=mutable_bookmark	mutable
@@ -544,7 +880,7 @@ fn test_revisions() {
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "git", "push", "--named", "a=a"]);
+    let output = work_dir.complete_fish(["git", "push", "--named", "a=a"]);
     insta::assert_snapshot!(output, @r"
     a=alias_with_newline	    roots(
     [EOF]
@@ -576,12 +912,9 @@ fn test_operations() {
         .run_jj(["describe", "-m", "description 4"])
         .success();
 
-    let mut test_env = test_env;
-    test_env.add_env_var("COMPLETE", "fish");
-    let test_env = test_env;
     let work_dir = test_env.work_dir("repo");
 
-    let output = work_dir.run_jj(["--", "jj", "op", "show", ""]).success();
+    let output = work_dir.complete_fish(["op", "show", ""]).success();
     let add_workspace_id = output
         .stdout
         .raw()
@@ -593,54 +926,54 @@ fn test_operations() {
         .unwrap();
     insta::assert_snapshot!(add_workspace_id, @"eac759b9ab75");
 
-    let output = work_dir.run_jj(["--", "jj", "op", "show", "5"]);
+    let output = work_dir.complete_fish(["op", "show", "5"]);
     insta::assert_snapshot!(output, @r"
     5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
     518b588abbc6	(2001-02-03 08:05:09) describe commit 19611c995a342c01f525583e5fcafdd211f6d009
     [EOF]
     ");
     // make sure global --at-op flag is respected
-    let output = work_dir.run_jj(["--", "jj", "--at-op", "518b588abbc6", "op", "show", "5"]);
+    let output = work_dir.complete_fish(["--at-op", "518b588abbc6", "op", "show", "5"]);
     insta::assert_snapshot!(output, @r"
     518b588abbc6	(2001-02-03 08:05:09) describe commit 19611c995a342c01f525583e5fcafdd211f6d009
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "--at-op", "5b"]);
+    let output = work_dir.complete_fish(["--at-op", "5b"]);
     insta::assert_snapshot!(output, @r"
     5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "op", "abandon", "5b"]);
+    let output = work_dir.complete_fish(["op", "abandon", "5b"]);
     insta::assert_snapshot!(output, @r"
     5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "op", "diff", "--op", "5b"]);
+    let output = work_dir.complete_fish(["op", "diff", "--op", "5b"]);
     insta::assert_snapshot!(output, @r"
     5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
     [EOF]
     ");
-    let output = work_dir.run_jj(["--", "jj", "op", "diff", "--from", "5b"]);
+    let output = work_dir.complete_fish(["op", "diff", "--from", "5b"]);
     insta::assert_snapshot!(output, @r"
     5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
     [EOF]
     ");
-    let output = work_dir.run_jj(["--", "jj", "op", "diff", "--to", "5b"]);
-    insta::assert_snapshot!(output, @r"
-    5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
-    [EOF]
-    ");
-
-    let output = work_dir.run_jj(["--", "jj", "op", "restore", "5b"]);
+    let output = work_dir.complete_fish(["op", "diff", "--to", "5b"]);
     insta::assert_snapshot!(output, @r"
     5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "op", "undo", "5b"]);
+    let output = work_dir.complete_fish(["op", "restore", "5b"]);
+    insta::assert_snapshot!(output, @r"
+    5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
+    [EOF]
+    ");
+
+    let output = work_dir.complete_fish(["op", "undo", "5b"]);
     insta::assert_snapshot!(output, @r"
     5bbb4ca536a8	(2001-02-03 08:05:12) describe commit 968261075dddabf4b0e333c1cc9a49ce26a3f710
     [EOF]
@@ -661,12 +994,9 @@ fn test_workspaces() {
         .run_jj(["workspace", "add", "--name", "def-second", "../secondary"])
         .success();
 
-    let mut test_env = test_env;
-    test_env.add_env_var("COMPLETE", "fish");
-    let test_env = test_env;
     let main_dir = test_env.work_dir("main");
 
-    let output = main_dir.run_jj(["--", "jj", "workspace", "forget", "def"]);
+    let output = main_dir.complete_fish(["workspace", "forget", "def"]);
     insta::assert_snapshot!(output, @r"
     def-second	(no description set)
     default	initial
@@ -676,18 +1006,16 @@ fn test_workspaces() {
 
 #[test]
 fn test_config() {
-    let mut test_env = TestEnvironment::default();
-    test_env.add_env_var("COMPLETE", "fish");
-    let dir = test_env.env_root();
+    let test_env = TestEnvironment::default();
 
-    let output = test_env.run_jj_in(dir, ["--", "jj", "config", "get", "c"]);
+    let output = test_env.complete_fish(["config", "get", "c"]);
     insta::assert_snapshot!(output, @r"
     core.fsmonitor	Whether to use an external filesystem monitor, useful for large repos
     core.watchman.register-snapshot-trigger	Whether to use triggers to monitor for changes in the background.
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(dir, ["--", "jj", "config", "list", "c"]);
+    let output = test_env.complete_fish(["config", "list", "c"]);
     insta::assert_snapshot!(output, @r"
     colors	Mapping from jj formatter labels to colors
     core
@@ -697,42 +1025,28 @@ fn test_config() {
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(dir, ["--", "jj", "log", "--config", "c"]);
+    let output = test_env.complete_fish(["log", "--config", "c"]);
     insta::assert_snapshot!(output, @r"
     core.fsmonitor=	Whether to use an external filesystem monitor, useful for large repos
     core.watchman.register-snapshot-trigger=	Whether to use triggers to monitor for changes in the background.
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(
-        dir,
-        ["--", "jj", "log", "--config", "ui.conflict-marker-style="],
-    );
+    let output = test_env.complete_fish(["log", "--config", "ui.conflict-marker-style="]);
     insta::assert_snapshot!(output, @r"
     ui.conflict-marker-style=diff
     ui.conflict-marker-style=snapshot
     ui.conflict-marker-style=git
     [EOF]
     ");
-    let output = test_env.run_jj_in(
-        dir,
-        ["--", "jj", "log", "--config", "ui.conflict-marker-style=g"],
-    );
+
+    let output = test_env.complete_fish(["log", "--config", "ui.conflict-marker-style=g"]);
     insta::assert_snapshot!(output, @r"
     ui.conflict-marker-style=git
     [EOF]
     ");
 
-    let output = test_env.run_jj_in(
-        dir,
-        [
-            "--",
-            "jj",
-            "log",
-            "--config",
-            "git.abandon-unreachable-commits=",
-        ],
-    );
+    let output = test_env.complete_fish(["log", "--config", "git.abandon-unreachable-commits="]);
     insta::assert_snapshot!(output, @r"
     git.abandon-unreachable-commits=false
     git.abandon-unreachable-commits=true
@@ -742,11 +1056,9 @@ fn test_config() {
 
 #[test]
 fn test_template_alias() {
-    let mut test_env = TestEnvironment::default();
-    test_env.add_env_var("COMPLETE", "fish");
-    let dir = test_env.env_root();
+    let test_env = TestEnvironment::default();
 
-    let output = test_env.run_jj_in(dir, ["--", "jj", "log", "-T", ""]);
+    let output = test_env.complete_fish(["log", "-T", ""]);
     insta::assert_snapshot!(output, @r"
     builtin_config_list
     builtin_config_list_detailed
@@ -764,6 +1076,7 @@ fn test_template_alias() {
     builtin_op_log_node_ascii
     builtin_op_log_oneline
     commit_summary_separator
+    default_commit_description
     description_placeholder
     email_placeholder
     git_format_patch_email_headers
@@ -920,12 +1233,9 @@ fn test_files() {
     [EOF]
     ");
 
-    let mut test_env = test_env;
-    test_env.add_env_var("COMPLETE", "fish");
-    let test_env = test_env;
     let work_dir = test_env.work_dir("repo");
 
-    let output = work_dir.run_jj(["--", "jj", "file", "show", "f_"]);
+    let output = work_dir.complete_fish(["file", "show", "f_"]);
     insta::assert_snapshot!(output.normalize_backslash(), @r"
     f_added
     f_added_2
@@ -936,7 +1246,7 @@ fn test_files() {
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "file", "annotate", "-r@-", "f_"]);
+    let output = work_dir.complete_fish(["file", "annotate", "-r@-", "f_"]);
     insta::assert_snapshot!(output.normalize_backslash(), @r"
     f_added
     f_dir/
@@ -945,7 +1255,8 @@ fn test_files() {
     f_unchanged
     [EOF]
     ");
-    let output = work_dir.run_jj(["--", "jj", "diff", "-r", "@-", "f_"]);
+
+    let output = work_dir.complete_fish(["diff", "-r", "@-", "f_"]);
     insta::assert_snapshot!(output.normalize_backslash(), @r"
     f_added	Added
     f_deleted	Deleted
@@ -956,9 +1267,7 @@ fn test_files() {
     [EOF]
     ");
 
-    let output = work_dir.run_jj([
-        "--",
-        "jj",
+    let output = work_dir.complete_fish([
         "diff",
         "-r",
         "@-",
@@ -971,7 +1280,7 @@ fn test_files() {
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "diff", "--from", "root()", "--to", "@-", "f_"]);
+    let output = work_dir.complete_fish(["diff", "--from", "root()", "--to", "@-", "f_"]);
     insta::assert_snapshot!(output.normalize_backslash(), @r"
     f_added	Added
     f_dir/
@@ -982,9 +1291,7 @@ fn test_files() {
     ");
 
     // interdiff has a different behavior with --from and --to flags
-    let output = work_dir.run_jj([
-        "--",
-        "jj",
+    let output = work_dir.complete_fish([
         "interdiff",
         "--to=interdiff_to",
         "--from=interdiff_from",
@@ -999,7 +1306,7 @@ fn test_files() {
     ");
 
     // squash has a different behavior with --from and --to flags
-    let output = work_dir.run_jj(["--", "jj", "squash", "-f=first", "f_"]);
+    let output = work_dir.complete_fish(["squash", "-f=first", "f_"]);
     insta::assert_snapshot!(output.normalize_backslash(), @r"
     f_deleted	Added
     f_modified	Added
@@ -1008,14 +1315,14 @@ fn test_files() {
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "resolve", "-r=conflicted", "f_"]);
+    let output = work_dir.complete_fish(["resolve", "-r=conflicted", "f_"]);
     insta::assert_snapshot!(output.normalize_backslash(), @r"
     f_dir/
     f_modified
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["--", "jj", "log", "f_"]);
+    let output = work_dir.complete_fish(["log", "f_"]);
     insta::assert_snapshot!(output.normalize_backslash(), @r"
     f_added
     f_added_2
@@ -1025,15 +1332,8 @@ fn test_files() {
     f_unchanged
     [EOF]
     ");
-    let output = work_dir.run_jj([
-        "--",
-        "jj",
-        "log",
-        "-r=first",
-        "--revisions",
-        "conflicted",
-        "f_",
-    ]);
+
+    let output = work_dir.complete_fish(["log", "-r=first", "--revisions", "conflicted", "f_"]);
     insta::assert_snapshot!(output.normalize_backslash(), @r"
     f_added_2
     f_deleted
@@ -1045,6 +1345,6 @@ fn test_files() {
     ");
 
     let outside_repo = test_env.env_root();
-    let output = test_env.run_jj_in(outside_repo, ["--", "jj", "log", "f_"]);
+    let output = test_env.work_dir(outside_repo).complete_fish(["log", "f_"]);
     insta::assert_snapshot!(output, @"");
 }

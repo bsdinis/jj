@@ -14,8 +14,10 @@
 
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
+use bstr::ByteVec as _;
+use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
+use jj_lib::backend::BackendResult;
 use jj_lib::backend::CommitId;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::duplicate_commits;
@@ -30,6 +32,7 @@ use crate::cli_util::RevisionArg;
 use crate::command_error::user_error;
 use crate::command_error::CommandError;
 use crate::complete;
+use crate::formatter::PlainTextFormatter;
 use crate::ui::Ui;
 
 /// Create new changes with the same content as existing ones
@@ -45,19 +48,22 @@ use crate::ui::Ui;
 /// `--insert-after` or `--insert-before` arguments are provided, the new
 /// children indicated by the arguments will be rebased onto the heads of the
 /// specified commits.
+///
+/// By default, the duplicated commits retain the descriptions of the originals.
+/// This can be customized with the `templates.duplicate_description` setting.
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct DuplicateArgs {
     /// The revision(s) to duplicate (default: @)
     #[arg(
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::all_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     revisions_pos: Vec<RevisionArg>,
     #[arg(
         short = 'r',
         hide = true,
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::all_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     revisions_opt: Vec<RevisionArg>,
     /// The revision(s) to duplicate onto (can be repeated to create a merge
@@ -66,7 +72,7 @@ pub(crate) struct DuplicateArgs {
         long,
         short,
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::all_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     destination: Option<Vec<RevisionArg>>,
     /// The revision(s) to insert after (can be repeated to create a merge
@@ -77,7 +83,7 @@ pub(crate) struct DuplicateArgs {
         visible_alias = "after",
         conflicts_with = "destination",
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::all_revisions),
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     insert_after: Option<Vec<RevisionArg>>,
     /// The revision(s) to insert before (can be repeated to create a merge
@@ -88,7 +94,7 @@ pub(crate) struct DuplicateArgs {
         visible_alias = "before",
         conflicts_with = "destination",
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     insert_before: Option<Vec<RevisionArg>>,
 }
@@ -164,6 +170,27 @@ pub(crate) fn cmd_duplicate(
             }
         }
     }
+
+    let new_descs = {
+        let template = tx
+            .settings()
+            .get_string("templates.duplicate_description")?;
+        let parsed = tx.parse_commit_template(ui, &template)?;
+
+        to_duplicate
+            .iter()
+            .map(|commit_id| -> BackendResult<_> {
+                let mut output = Vec::new();
+                let commit = tx.repo().store().get_commit(commit_id)?;
+                parsed
+                    .format(&commit, &mut PlainTextFormatter::new(&mut output))
+                    .expect("write() to vec backed formatter should never fail");
+
+                Ok((commit_id.clone(), output.into_string_lossy()))
+            })
+            .try_collect()?
+    };
+
     let num_to_duplicate = to_duplicate.len();
     let DuplicateCommitsStats {
         duplicated_commits,
@@ -172,11 +199,12 @@ pub(crate) fn cmd_duplicate(
         duplicate_commits(
             tx.repo_mut(),
             &to_duplicate,
+            &new_descs,
             &parent_commit_ids,
             &children_commit_ids,
         )?
     } else {
-        duplicate_commits_onto_parents(tx.repo_mut(), &to_duplicate)?
+        duplicate_commits_onto_parents(tx.repo_mut(), &to_duplicate, &new_descs)?
     };
 
     if let Some(mut formatter) = ui.status_formatter() {

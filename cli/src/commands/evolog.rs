@@ -15,14 +15,12 @@
 use std::convert::Infallible;
 
 use clap_complete::ArgValueCandidates;
+use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
-use jj_lib::backend::BackendError;
-use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
 use jj_lib::dag_walk::topo_order_reverse_ok;
 use jj_lib::graph::reverse_graph;
 use jj_lib::graph::GraphEdge;
-use jj_lib::graph::GraphNode;
 use jj_lib::matchers::EverythingMatcher;
 use tracing::instrument;
 
@@ -32,7 +30,7 @@ use crate::cli_util::CommandHelper;
 use crate::cli_util::LogContentFormat;
 use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
-use crate::commit_templater::CommitTemplateLanguage;
+use crate::commit_templater::CommitTemplatePropertyKind;
 use crate::complete;
 use crate::diff_util::DiffFormatArgs;
 use crate::graphlog::get_graphlog;
@@ -49,7 +47,7 @@ pub(crate) struct EvologArgs {
         long, short,
         default_value = "@",
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::all_revisions),
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     revision: RevisionArg,
     /// Limit number of revisions to show
@@ -117,7 +115,7 @@ pub(crate) fn cmd_evolog(
                 ui,
                 &language,
                 &template_string,
-                CommitTemplateLanguage::wrap_commit,
+                CommitTemplatePropertyKind::wrap_commit,
             )?
             .labeled("log");
         node_template = workspace_command
@@ -125,7 +123,7 @@ pub(crate) fn cmd_evolog(
                 ui,
                 &language,
                 &get_node_template(graph_style, workspace_command.settings())?,
-                CommitTemplateLanguage::wrap_commit_opt,
+                CommitTemplatePropertyKind::wrap_commit_opt,
             )?
             .labeled("node");
     }
@@ -160,26 +158,26 @@ pub(crate) fn cmd_evolog(
         let mut raw_output = formatter.raw()?;
         let mut graph = get_graphlog(graph_style, raw_output.as_mut());
 
-        let commit_dag: Vec<GraphNode<Commit, CommitId>> = commits
+        let commit_nodes = commits
             .into_iter()
-            .map(|c| -> Result<_, BackendError> {
+            .map(|c| {
                 let ids = c.predecessor_ids();
-                let edges = ids.iter().cloned().map(GraphEdge::direct).collect();
-                Ok((c, edges))
+                let edges = ids.iter().cloned().map(GraphEdge::direct).collect_vec();
+                (c, edges)
             })
-            .try_collect()?;
+            .collect_vec();
 
-        let iter_nodes = if args.reversed {
+        let commit_nodes = if args.reversed {
             reverse_graph(
-                commit_dag.into_iter().map(Result::<_, Infallible>::Ok),
+                commit_nodes.into_iter().map(Result::<_, Infallible>::Ok),
                 Commit::id,
             )
             .unwrap()
         } else {
-            commit_dag
+            commit_nodes
         };
 
-        for node in iter_nodes {
+        for node in commit_nodes {
             let (commit, edges) = node;
             let mut buffer = vec![];
             let within_graph = with_content_format.sub_width(graph.width(commit.id(), &edges));

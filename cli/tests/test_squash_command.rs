@@ -1239,6 +1239,25 @@ fn test_squash_description() {
     [EOF]
     ");
 
+    // An explicit description on the command-line includes the trailers when
+    // templates.commit_trailers is configured
+    work_dir.run_jj(["undo"]).success();
+    work_dir
+        .run_jj([
+            "squash",
+            "--config",
+            r#"templates.commit_trailers='"CC: " ++ committer.email()'"#,
+            "-m",
+            "custom",
+        ])
+        .success();
+    insta::assert_snapshot!(get_description(&work_dir, "@-"), @r"
+    custom
+
+    CC: test.user@example.com
+    [EOF]
+    ");
+
     // If the source's *content* doesn't become empty, then the source remains and
     // both descriptions are unchanged
     work_dir.run_jj(["undo"]).success();
@@ -1251,6 +1270,155 @@ fn test_squash_description() {
     source
     [EOF]
     ");
+
+    // A combined description should only contain the trailers from the
+    // commit_trailers template that were not in the squashed commits
+    work_dir.run_jj(["undo"]).success();
+    work_dir
+        .run_jj(["describe", "-m", "source\n\nfoo: bar"])
+        .success();
+    std::fs::write(&edit_script, "dump editor0").unwrap();
+    work_dir
+        .run_jj([
+            "squash",
+            "--config",
+            r#"templates.commit_trailers='"CC: alice@example.com\nfoo: bar"'"#,
+        ])
+        .success();
+    insta::assert_snapshot!(
+        std::fs::read_to_string(test_env.env_root().join("editor0")).unwrap(), @r#"
+    JJ: Enter a description for the combined commit.
+    JJ: Description from the destination commit:
+    destination
+
+    JJ: Description from source commit:
+    source
+
+    foo: bar
+
+    JJ: Trailers not found in the squashed commits:
+    CC: alice@example.com
+
+    JJ: This commit contains the following changes:
+    JJ:     A file1
+    JJ:     A file2
+    JJ:
+    JJ: Lines starting with "JJ:" (like this one) will be removed.
+    "#);
+
+    // If the destination description is non-empty and the source's description is
+    // empty, the resulting description is from the destination, with additional
+    // trailers if defined in the commit_trailers template
+    work_dir.run_jj(["op", "restore", "@--"]).success();
+    work_dir.run_jj(["describe", "-m", ""]).success();
+    insta::assert_snapshot!(get_log_output_with_description(&work_dir), @r"
+    @  97213fdca854
+    ○  98c5890febcb destination
+    ◆  000000000000
+    [EOF]
+    ");
+    work_dir
+        .run_jj([
+            "squash",
+            "--config",
+            r#"templates.commit_trailers='"CC: alice@example.com"'"#,
+        ])
+        .success();
+    insta::assert_snapshot!(get_description(&work_dir, "@-"), @r"
+    destination
+
+    CC: alice@example.com
+    [EOF]
+    ");
+
+    // If a single description is non-empty, the resulting description is
+    // from the destination, with additional trailers if defined in the
+    // commit_trailers template
+    work_dir.run_jj(["op", "restore", "@--"]).success();
+    work_dir
+        .run_jj(["describe", "-r", "@-", "-m", ""])
+        .success();
+    insta::assert_snapshot!(get_log_output_with_description(&work_dir), @r"
+    @  22a3c36f2858 source
+    ○  ad5f9d6b047a
+    ◆  000000000000
+    [EOF]
+    ");
+    work_dir
+        .run_jj([
+            "squash",
+            "--config",
+            r#"templates.commit_trailers='"CC: alice@example.com"'"#,
+        ])
+        .success();
+    insta::assert_snapshot!(get_description(&work_dir, "@-"), @r"
+    source
+
+    CC: alice@example.com
+    [EOF]
+    ");
+
+    // squashing messages with empty descriptions shouldn't add any trailer
+    work_dir.run_jj(["op", "restore", "@--"]).success();
+    work_dir
+        .run_jj(["describe", "-r", "..", "-m", ""])
+        .success();
+    insta::assert_snapshot!(get_log_output_with_description(&work_dir), @r"
+    @  7e485555f641
+    ○  99b4683afeaf
+    ◆  000000000000
+    [EOF]
+    ");
+    work_dir
+        .run_jj([
+            "squash",
+            "--config",
+            r#"templates.commit_trailers='"CC: bob@example.com"'"#,
+        ])
+        .success();
+    insta::assert_snapshot!(get_description(&work_dir, "@-"), @"");
+
+    // squashing messages with --use-destination-message on a commit with an
+    // empty description shouldn't add any trailer
+    work_dir.run_jj(["op", "restore", "@--"]).success();
+    work_dir
+        .run_jj(["describe", "-r", "@-", "-m", ""])
+        .success();
+    insta::assert_snapshot!(get_log_output_with_description(&work_dir), @r"
+    @  e4007dc838a3 source
+    ○  9bb558f5d51c
+    ◆  000000000000
+    [EOF]
+    ");
+    work_dir
+        .run_jj([
+            "squash",
+            "--use-destination-message",
+            "--config",
+            r#"templates.commit_trailers='"CC: bob@example.com"'"#,
+        ])
+        .success();
+    insta::assert_snapshot!(get_description(&work_dir, "@-"), @"");
+
+    // squashing with an empty message on the command line shouldn't add
+    // any trailer
+    work_dir.run_jj(["op", "restore", "@--"]).success();
+    insta::assert_snapshot!(get_log_output_with_description(&work_dir), @r"
+    @  5d1c6e004d1d source
+    ○  98c5890febcb destination
+    ◆  000000000000
+    [EOF]
+    ");
+    work_dir
+        .run_jj([
+            "squash",
+            "--message",
+            "",
+            "--config",
+            r#"templates.commit_trailers='"CC: bob@example.com"'"#,
+        ])
+        .success();
+    insta::assert_snapshot!(get_description(&work_dir, "@-"), @"");
 }
 
 #[test]

@@ -56,10 +56,14 @@ use jj_lib::revset::RevsetResolutionError;
 use jj_lib::revset::RevsetWorkspaceContext;
 use jj_lib::revset::SymbolResolver as _;
 use jj_lib::revset::SymbolResolverExtension;
+use jj_lib::signing::SignBehavior;
+use jj_lib::signing::Signer;
+use jj_lib::test_signing_backend::TestSigningBackend;
 use jj_lib::workspace::Workspace;
 use test_case::test_case;
 use testutils::create_random_commit;
 use testutils::create_tree;
+use testutils::repo_path;
 use testutils::write_random_commit;
 use testutils::CommitGraphBuilder;
 use testutils::TestRepo;
@@ -3050,6 +3054,54 @@ fn test_evaluate_expression_mine() {
 }
 
 #[test]
+fn test_evaluate_expression_signed() {
+    let signer = Signer::new(Some(Box::new(TestSigningBackend)), vec![]);
+    let settings = testutils::user_settings();
+    let test_workspace =
+        TestWorkspace::init_with_backend_and_signer(TestRepoBackend::Test, signer, &settings);
+    let repo = &test_workspace.repo;
+    let repo = repo.clone();
+
+    let mut tx = repo.start_transaction();
+    let mut_repo = tx.repo_mut();
+
+    let timestamp = Timestamp {
+        timestamp: MillisSinceEpoch(0),
+        tz_offset: 0,
+    };
+    let commit1 = create_random_commit(mut_repo)
+        .set_committer(Signature {
+            name: "name1".to_string(),
+            email: "email1".to_string(),
+            timestamp,
+        })
+        .set_sign_behavior(SignBehavior::Own)
+        .write()
+        .unwrap();
+    let commit2 = create_random_commit(mut_repo)
+        .set_parents(vec![commit1.id().clone()])
+        .set_committer(Signature {
+            name: "name2".to_string(),
+            email: "email2".to_string(),
+            timestamp,
+        })
+        .set_sign_behavior(SignBehavior::Drop)
+        .write()
+        .unwrap();
+
+    assert!(commit1.is_signed());
+    assert!(!commit2.is_signed());
+
+    let signed_commits = resolve_commit_ids(mut_repo, "signed()");
+    assert!(signed_commits.contains(commit1.id()));
+    assert!(!signed_commits.contains(commit2.id()));
+
+    let unsigned_commits = resolve_commit_ids(mut_repo, "~signed()");
+    assert!(!unsigned_commits.contains(commit1.id()));
+    assert!(unsigned_commits.contains(commit2.id()));
+}
+
+#[test]
 fn test_evaluate_expression_committer() {
     let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
@@ -3627,9 +3679,9 @@ fn test_evaluate_expression_file() {
     let mut tx = repo.start_transaction();
     let mut_repo = tx.repo_mut();
 
-    let added_clean_clean = RepoPath::from_internal_string("added_clean_clean");
-    let added_modified_clean = RepoPath::from_internal_string("added_modified_clean");
-    let added_modified_removed = RepoPath::from_internal_string("added_modified_removed");
+    let added_clean_clean = repo_path("added_clean_clean");
+    let added_modified_clean = repo_path("added_modified_clean");
+    let added_modified_removed = repo_path("added_modified_removed");
     let tree1 = create_tree(
         repo,
         &[
@@ -3738,13 +3790,10 @@ fn test_evaluate_expression_diff_contains() {
     let mut tx = repo.start_transaction();
     let mut_repo = tx.repo_mut();
 
-    let empty_clean_inserted_deleted =
-        RepoPath::from_internal_string("empty_clean_inserted_deleted");
-    let blank_clean_inserted_clean = RepoPath::from_internal_string("blank_clean_inserted_clean");
-    let noeol_modified_modified_clean =
-        RepoPath::from_internal_string("noeol_modified_modified_clean");
-    let normal_inserted_modified_removed =
-        RepoPath::from_internal_string("normal_inserted_modified_removed");
+    let empty_clean_inserted_deleted = repo_path("empty_clean_inserted_deleted");
+    let blank_clean_inserted_clean = repo_path("blank_clean_inserted_clean");
+    let noeol_modified_modified_clean = repo_path("noeol_modified_modified_clean");
+    let normal_inserted_modified_removed = repo_path("normal_inserted_modified_removed");
     let tree1 = create_tree(
         repo,
         &[
@@ -3872,6 +3921,39 @@ fn test_evaluate_expression_diff_contains() {
 }
 
 #[test]
+fn test_evaluate_expression_diff_contains_conflict() {
+    let test_workspace = TestWorkspace::init();
+    let repo = &test_workspace.repo;
+
+    let mut tx = repo.start_transaction();
+    let mut_repo = tx.repo_mut();
+
+    let file_path = repo_path("file");
+    let tree1 = create_tree(repo, &[(file_path, "0\n1\n")]);
+    let tree2 = create_tree(repo, &[(file_path, "0\n2\n")]);
+    let tree3 = create_tree(repo, &[(file_path, "0\n3\n")]);
+    let tree4 = tree2.merge(&tree1, &tree3).unwrap();
+
+    let mut create_commit =
+        |parent_ids, tree_id| mut_repo.new_commit(parent_ids, tree_id).write().unwrap();
+    let commit1 = create_commit(vec![repo.store().root_commit_id().clone()], tree1.id());
+    let commit2 = create_commit(vec![commit1.id().clone()], tree4.id());
+
+    assert_eq!(
+        resolve_commit_ids(mut_repo, "diff_contains('0')"),
+        vec![commit1.id().clone()]
+    );
+    assert_eq!(
+        resolve_commit_ids(mut_repo, "diff_contains('1')"),
+        vec![commit2.id().clone(), commit1.id().clone()]
+    );
+    assert_eq!(
+        resolve_commit_ids(mut_repo, "diff_contains('2')"),
+        vec![commit2.id().clone()]
+    );
+}
+
+#[test]
 fn test_evaluate_expression_file_merged_parents() {
     let test_workspace = TestWorkspace::init();
     let repo = &test_workspace.repo;
@@ -3880,8 +3962,8 @@ fn test_evaluate_expression_file_merged_parents() {
     let mut_repo = tx.repo_mut();
 
     // file2 can be merged automatically, file1 can't.
-    let file_path1 = RepoPath::from_internal_string("file1");
-    let file_path2 = RepoPath::from_internal_string("file2");
+    let file_path1 = repo_path("file1");
+    let file_path2 = repo_path("file2");
     let tree1 = create_tree(repo, &[(file_path1, "1\n"), (file_path2, "1\n")]);
     let tree2 = create_tree(repo, &[(file_path1, "1\n2\n"), (file_path2, "2\n1\n")]);
     let tree3 = create_tree(repo, &[(file_path1, "1\n3\n"), (file_path2, "1\n3\n")]);
@@ -3949,8 +4031,8 @@ fn test_evaluate_expression_conflict() {
     let mut_repo = tx.repo_mut();
 
     // Create a few trees, including one with a conflict in `file1`
-    let file_path1 = RepoPath::from_internal_string("file1");
-    let file_path2 = RepoPath::from_internal_string("file2");
+    let file_path1 = repo_path("file1");
+    let file_path2 = repo_path("file2");
     let tree1 = create_tree(repo, &[(file_path1, "1"), (file_path2, "1")]);
     let tree2 = create_tree(repo, &[(file_path1, "2"), (file_path2, "2")]);
     let tree3 = create_tree(repo, &[(file_path1, "3"), (file_path2, "1")]);

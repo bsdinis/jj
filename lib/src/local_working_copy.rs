@@ -226,8 +226,8 @@ impl FileStatesMap {
     ) -> Self {
         if !is_sorted {
             data.sort_unstable_by(|entry1, entry2| {
-                let path1 = RepoPath::from_internal_string(&entry1.path);
-                let path2 = RepoPath::from_internal_string(&entry2.path);
+                let path1 = RepoPath::from_internal_string(&entry1.path).unwrap();
+                let path2 = RepoPath::from_internal_string(&entry2.path).unwrap();
                 path1.cmp(path2)
             });
         }
@@ -256,7 +256,9 @@ impl FileStatesMap {
             mem::take(&mut self.data),
             changed_file_states,
             |old_entry, (changed_path, _)| {
-                RepoPath::from_internal_string(&old_entry.path).cmp(changed_path)
+                RepoPath::from_internal_string(&old_entry.path)
+                    .unwrap()
+                    .cmp(changed_path)
             },
         )
         .filter_map(|diff| match diff {
@@ -265,7 +267,8 @@ impl FileStatesMap {
                 Some(file_state_entry_to_proto(path, &state))
             }
             EitherOrBoth::Left(entry) => {
-                let present = !deleted_files.contains(RepoPath::from_internal_string(&entry.path));
+                let present =
+                    !deleted_files.contains(RepoPath::from_internal_string(&entry.path).unwrap());
                 present.then_some(entry)
             }
         })
@@ -334,7 +337,11 @@ impl<'a> FileStates<'a> {
 
     fn exact_position(&self, path: &RepoPath) -> Option<usize> {
         self.data
-            .binary_search_by(|entry| RepoPath::from_internal_string(&entry.path).cmp(path))
+            .binary_search_by(|entry| {
+                RepoPath::from_internal_string(&entry.path)
+                    .unwrap()
+                    .cmp(path)
+            })
             .ok()
     }
 
@@ -357,9 +364,12 @@ impl<'a> FileStates<'a> {
     fn prefixed_range(&self, base: &RepoPath) -> Range<usize> {
         let start = self
             .data
-            .partition_point(|entry| RepoPath::from_internal_string(&entry.path) < base);
-        let len = self.data[start..]
-            .partition_point(|entry| RepoPath::from_internal_string(&entry.path).starts_with(base));
+            .partition_point(|entry| RepoPath::from_internal_string(&entry.path).unwrap() < base);
+        let len = self.data[start..].partition_point(|entry| {
+            RepoPath::from_internal_string(&entry.path)
+                .unwrap()
+                .starts_with(base)
+        });
         start..(start + len)
     }
 
@@ -389,7 +399,7 @@ impl<'a> FileStates<'a> {
     pub fn paths(&self) -> impl ExactSizeIterator<Item = &'a RepoPath> + use<'a> {
         self.data
             .iter()
-            .map(|entry| RepoPath::from_internal_string(&entry.path))
+            .map(|entry| RepoPath::from_internal_string(&entry.path).unwrap())
     }
 }
 
@@ -478,7 +488,7 @@ fn file_state_to_proto(file_state: &FileState) -> crate::protos::working_copy::F
 fn file_state_entry_from_proto(
     proto: &crate::protos::working_copy::FileStateEntry,
 ) -> (&RepoPath, FileState) {
-    let path = RepoPath::from_internal_string(&proto.path);
+    let path = RepoPath::from_internal_string(&proto.path).unwrap();
     (path, file_state_from_proto(proto.state.as_ref().unwrap()))
 }
 
@@ -496,7 +506,7 @@ fn is_file_state_entries_proto_unique_and_sorted(
     data: &[crate::protos::working_copy::FileStateEntry],
 ) -> bool {
     data.iter()
-        .map(|entry| RepoPath::from_internal_string(&entry.path))
+        .map(|entry| RepoPath::from_internal_string(&entry.path).unwrap())
         .tuple_windows()
         .all(|(path1, path2)| path1 < path2)
 }
@@ -507,7 +517,7 @@ fn sparse_patterns_from_proto(
     let mut sparse_patterns = vec![];
     if let Some(proto_sparse_patterns) = proto {
         for prefix in &proto_sparse_patterns.prefixes {
-            sparse_patterns.push(RepoPathBuf::from_internal_string(prefix));
+            sparse_patterns.push(RepoPathBuf::from_internal_string(prefix).unwrap());
         }
     } else {
         // For compatibility with old working copies.
@@ -1231,7 +1241,7 @@ impl FileSnapshotter<'_> {
         if RESERVED_DIR_NAMES.contains(&name_string.as_str()) {
             return Ok(None);
         }
-        let name = RepoPathComponent::new(&name_string);
+        let name = RepoPathComponent::new(&name_string).unwrap();
         let path = dir.join(name);
         let maybe_current_file_state = file_states.get_at(dir, name);
         if let Some(file_state) = &maybe_current_file_state {
@@ -1513,7 +1523,7 @@ impl FileSnapshotter<'_> {
                     data.conflict_marker_len as usize
                 }),
             )
-            .block_on()?;
+            .await?;
             match new_file_ids.into_resolved() {
                 Ok(file_id) => {
                     // On Windows, we preserve the executable bit from the merged trees.
@@ -1521,7 +1531,7 @@ impl FileSnapshotter<'_> {
                     let executable = {
                         let () = executable; // use the variable
                         if let Some(merge) = current_tree_values.to_executable_merge() {
-                            merge.resolve_trivial().copied().unwrap_or_default()
+                            conflicts::resolve_file_executable(&merge).unwrap_or(false)
                         } else {
                             false
                         }
@@ -1848,14 +1858,11 @@ impl TreeState {
                 MaterializedTreeValue::Tree(_) => {
                     panic!("unexpected tree entry in diff at {path:?}");
                 }
-                MaterializedTreeValue::FileConflict {
-                    id: _,
-                    contents,
-                    executable,
-                } => {
-                    let conflict_marker_len = choose_materialized_conflict_marker_len(&contents);
+                MaterializedTreeValue::FileConflict(file) => {
+                    let conflict_marker_len =
+                        choose_materialized_conflict_marker_len(&file.contents);
                     let data = materialize_merge_result_to_bytes_with_marker_len(
-                        &contents,
+                        &file.contents,
                         conflict_marker_style,
                         conflict_marker_len,
                     )
@@ -1866,7 +1873,7 @@ impl TreeState {
                     self.write_conflict(
                         &disk_path,
                         data,
-                        executable,
+                        file.executable.unwrap_or(false),
                         Some(materialized_conflict_data),
                     )?
                 }
@@ -2384,7 +2391,11 @@ mod tests {
     use super::*;
 
     fn repo_path(value: &str) -> &RepoPath {
-        RepoPath::from_internal_string(value)
+        RepoPath::from_internal_string(value).unwrap()
+    }
+
+    fn repo_path_component(value: &str) -> &RepoPathComponent {
+        RepoPathComponent::new(value).unwrap()
     }
 
     #[test]
@@ -2525,56 +2536,53 @@ mod tests {
 
         // At root
         assert_eq!(
-            file_states.get_at(RepoPath::root(), RepoPathComponent::new("b")),
+            file_states.get_at(RepoPath::root(), repo_path_component("b")),
             None
         );
         assert_eq!(
-            file_states.get_at(RepoPath::root(), RepoPathComponent::new("b#")),
+            file_states.get_at(RepoPath::root(), repo_path_component("b#")),
             Some(new_state(4))
         );
 
         // At prefixed dir
-        let prefixed_states =
-            file_states.prefixed_at(RepoPath::root(), RepoPathComponent::new("b"));
+        let prefixed_states = file_states.prefixed_at(RepoPath::root(), repo_path_component("b"));
         assert_eq!(
             prefixed_states.paths().collect_vec(),
             ["b/c", "b/d/e", "b/d#", "b/e"].map(repo_path)
         );
         assert_eq!(
-            prefixed_states.get_at(repo_path("b"), RepoPathComponent::new("c")),
+            prefixed_states.get_at(repo_path("b"), repo_path_component("c")),
             Some(new_state(0))
         );
         assert_eq!(
-            prefixed_states.get_at(repo_path("b"), RepoPathComponent::new("d")),
+            prefixed_states.get_at(repo_path("b"), repo_path_component("d")),
             None
         );
         assert_eq!(
-            prefixed_states.get_at(repo_path("b"), RepoPathComponent::new("d#")),
+            prefixed_states.get_at(repo_path("b"), repo_path_component("d#")),
             Some(new_state(2))
         );
 
         // At nested prefixed dir
-        let prefixed_states =
-            prefixed_states.prefixed_at(repo_path("b"), RepoPathComponent::new("d"));
+        let prefixed_states = prefixed_states.prefixed_at(repo_path("b"), repo_path_component("d"));
         assert_eq!(
             prefixed_states.paths().collect_vec(),
             ["b/d/e"].map(repo_path)
         );
         assert_eq!(
-            prefixed_states.get_at(repo_path("b/d"), RepoPathComponent::new("e")),
+            prefixed_states.get_at(repo_path("b/d"), repo_path_component("e")),
             Some(new_state(1))
         );
         assert_eq!(
-            prefixed_states.get_at(repo_path("b/d"), RepoPathComponent::new("#")),
+            prefixed_states.get_at(repo_path("b/d"), repo_path_component("#")),
             None
         );
 
         // At prefixed file
-        let prefixed_states =
-            file_states.prefixed_at(RepoPath::root(), RepoPathComponent::new("b#"));
+        let prefixed_states = file_states.prefixed_at(RepoPath::root(), repo_path_component("b#"));
         assert_eq!(prefixed_states.paths().collect_vec(), ["b#"].map(repo_path));
         assert_eq!(
-            prefixed_states.get_at(repo_path("b#"), RepoPathComponent::new("#")),
+            prefixed_states.get_at(repo_path("b#"), repo_path_component("#")),
             None
         );
     }

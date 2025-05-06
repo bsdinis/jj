@@ -158,7 +158,7 @@ pub struct GitPushArgs {
         // While `-r` will often be used with mutable revisions, immutable
         // revisions can be useful as parts of revsets or to push
         // special-purpose branches.
-        add = ArgValueCandidates::new(complete::all_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     revisions: Vec<RevisionArg>,
     /// Push this commit by creating a bookmark based on its change ID (can be
@@ -175,7 +175,7 @@ pub struct GitPushArgs {
         // recently created mutable revisions, even though it can in theory
         // be used with immutable ones as well. We can change it if the guess
         // turns out to be wrong.
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     change: Vec<RevisionArg>,
     /// Specify a new bookmark name and a revision to push under that name, e.g.
@@ -292,10 +292,11 @@ pub fn cmd_git_push(
     } else {
         let mut seen_bookmarks: HashSet<&RefName> = HashSet::new();
 
-        // Process --change bookmarks first because matching bookmarks can be moved.
+        // --change and --named don't move existing bookmarks. If they did, be
+        // careful to not select old state by -r/--revisions and bookmark names.
         let bookmark_prefix = tx.settings().get_string("git.push-bookmark-prefix")?;
         let change_bookmark_names =
-            update_change_bookmarks(ui, &mut tx, &args.change, &bookmark_prefix)?;
+            create_change_bookmarks(ui, &mut tx, &args.change, &bookmark_prefix)?;
         let created_bookmark_names: Vec<RefNameBuf> = args
             .named
             .iter()
@@ -810,6 +811,29 @@ fn classify_bookmark_update(
     }
 }
 
+fn ensure_new_bookmark_name(view: &View, name: &RefName) -> Result<(), CommandError> {
+    let symbol = name.as_symbol();
+    if view.get_local_bookmark(name).is_present() {
+        return Err(user_error_with_hint(
+            format!("Bookmark already exists: {symbol}"),
+            format!(
+                "Use 'jj bookmark move' to move it, and 'jj git push -b {symbol} [--allow-new]' \
+                 to push it"
+            ),
+        ));
+    }
+    if has_tracked_remote_bookmarks(view, name) {
+        return Err(user_error_with_hint(
+            format!("Tracked remote bookmarks exist for deleted bookmark: {symbol}"),
+            format!(
+                "Use `jj bookmark set` to recreate the local bookmark. Run `jj bookmark untrack \
+                 'glob:{symbol}@*'` to disassociate them."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Creates a bookmark for a single `--named` argument and returns its name
 ///
 /// The logic is not identical to that of `jj bookmark create` since we need to
@@ -840,25 +864,7 @@ fn create_explicitly_named_bookmarks(
         )
         .hinted(hint)
     })?;
-    let symbol = name.as_symbol();
-    if tx.repo().view().get_local_bookmark(&name).is_present() {
-        return Err(user_error_with_hint(
-            format!("Bookmark already exists: {symbol}"),
-            format!(
-                "Use 'jj bookmark move' to move it, and 'jj git push -b {symbol} [--allow-new]' \
-                 to push it"
-            ),
-        ));
-    }
-    if has_tracked_remote_bookmarks(tx.repo().view(), &name) {
-        return Err(user_error_with_hint(
-            format!("Tracked remote bookmarks exist for deleted bookmark: {symbol}"),
-            format!(
-                "Use `jj bookmark set` to recreate the local bookmark. Run `jj bookmark untrack \
-                 'glob:{symbol}@*'` to disassociate them."
-            ),
-        ));
-    }
+    ensure_new_bookmark_name(tx.repo().view(), &name)?;
     let revision = tx
         .base_workspace_helper()
         .resolve_single_rev(ui, &revision_str.to_string().into())?;
@@ -867,8 +873,8 @@ fn create_explicitly_named_bookmarks(
     Ok(name)
 }
 
-/// Creates or moves bookmarks based on the change IDs.
-fn update_change_bookmarks(
+/// Creates bookmarks based on the change IDs.
+fn create_change_bookmarks(
     ui: &Ui,
     tx: &mut WorkspaceCommandTransaction,
     changes: &[RevisionArg],
@@ -890,18 +896,21 @@ fn update_change_bookmarks(
 
     for commit in all_commits {
         let short_change_id = short_change_hash(commit.change_id());
-        let bookmark_name: RefNameBuf = format!("{bookmark_prefix}{short_change_id}").into();
+        let name: RefNameBuf = format!("{bookmark_prefix}{short_change_id}").into();
+        let target = RefTarget::normal(commit.id().clone());
         let view = tx.base_repo().view();
-        if view.get_local_bookmark(&bookmark_name).is_absent() {
+        if view.get_local_bookmark(&name) == &target {
+            // Existing bookmark pointing to the commit, which is allowed
+        } else {
+            ensure_new_bookmark_name(view, &name)?;
             writeln!(
                 ui.status(),
-                "Creating bookmark {bookmark_name} for revision {short_change_id}",
-                bookmark_name = bookmark_name.as_symbol()
+                "Creating bookmark {name} for revision {short_change_id}",
+                name = name.as_symbol()
             )?;
+            tx.repo_mut().set_local_bookmark_target(&name, target);
         }
-        tx.repo_mut()
-            .set_local_bookmark_target(&bookmark_name, RefTarget::normal(commit.id().clone()));
-        bookmark_names.push(bookmark_name);
+        bookmark_names.push(name);
     }
     Ok(bookmark_names)
 }

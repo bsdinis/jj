@@ -199,14 +199,15 @@ fn test_split_with_non_empty_description() {
     )
     .unwrap();
     let output = work_dir.run_jj(["split", "file1"]);
-    insta::assert_snapshot!(output, @r"
+    insta::assert_snapshot!(output, @r#"
     ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
     First part: qpvuntsm 231a3c00 part 1
     Second part: kkmpptxz e96291aa part 2
     Working copy  (@) now at: kkmpptxz e96291aa part 2
     Parent commit (@-)      : qpvuntsm 231a3c00 part 1
     [EOF]
-    ");
+    "#);
 
     insta::assert_snapshot!(
         std::fs::read_to_string(test_env.env_root().join("editor1")).unwrap(), @r#"
@@ -228,12 +229,15 @@ fn test_split_with_non_empty_description() {
     JJ:
     JJ: Lines starting with "JJ:" (like this one) will be removed.
     "#);
-    insta::assert_snapshot!(get_log_output(&work_dir), @r"
+    insta::assert_snapshot!(get_log_output(&work_dir), @r#"
     @  kkmpptxzrspx false part 2
     ○  qpvuntsmwlqt false part 1
     ◆  zzzzzzzzzzzz true
     [EOF]
-    ");
+    ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
+    [EOF]
+    "#);
 }
 
 #[test]
@@ -253,14 +257,15 @@ fn test_split_with_default_description() {
     )
     .unwrap();
     let output = work_dir.run_jj(["split", "file1"]);
-    insta::assert_snapshot!(output, @r"
+    insta::assert_snapshot!(output, @r#"
     ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
     First part: qpvuntsm 02ee5d60 TESTED=TODO
     Second part: rlvkpnrz 33cd046b (no description set)
     Working copy  (@) now at: rlvkpnrz 33cd046b (no description set)
     Parent commit (@-)      : qpvuntsm 02ee5d60 TESTED=TODO
     [EOF]
-    ");
+    "#);
 
     // Since the commit being split has no description, the user will only be
     // prompted to add a description to the first commit, which will use the
@@ -279,12 +284,15 @@ fn test_split_with_default_description() {
     JJ: Lines starting with "JJ:" (like this one) will be removed.
     "#);
     assert!(!test_env.env_root().join("editor2").exists());
-    insta::assert_snapshot!(get_log_output(&work_dir), @r"
+    insta::assert_snapshot!(get_log_output(&work_dir), @r#"
     @  rlvkpnrzqnoo false
     ○  qpvuntsmwlqt false TESTED=TODO
     ◆  zzzzzzzzzzzz true
     [EOF]
-    ");
+    ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
+    [EOF]
+    "#);
 }
 
 #[test]
@@ -471,11 +479,14 @@ fn test_split_parallel_no_descendants() {
     work_dir.write_file("file1", "foo\n");
     work_dir.write_file("file2", "bar\n");
 
-    insta::assert_snapshot!(get_log_output(&work_dir), @r"
+    insta::assert_snapshot!(get_log_output(&work_dir), @r#"
     @  qpvuntsmwlqt false
     ◆  zzzzzzzzzzzz true
     [EOF]
-    ");
+    ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
+    [EOF]
+    "#);
 
     std::fs::write(
         edit_script,
@@ -483,22 +494,26 @@ fn test_split_parallel_no_descendants() {
     )
     .unwrap();
     let output = work_dir.run_jj(["split", "--parallel", "file1"]);
-    insta::assert_snapshot!(output, @r"
+    insta::assert_snapshot!(output, @r#"
     ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
     First part: qpvuntsm 48018df6 TESTED=TODO
     Second part: kkmpptxz 7eddbf93 (no description set)
     Working copy  (@) now at: kkmpptxz 7eddbf93 (no description set)
     Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
     Added 0 files, modified 0 files, removed 1 files
     [EOF]
-    ");
-    insta::assert_snapshot!(get_log_output(&work_dir), @r"
+    "#);
+    insta::assert_snapshot!(get_log_output(&work_dir), @r#"
     @  kkmpptxzrspx false
     │ ○  qpvuntsmwlqt false TESTED=TODO
     ├─╯
     ◆  zzzzzzzzzzzz true
     [EOF]
-    ");
+    ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
+    [EOF]
+    "#);
 
     // Since the commit being split has no description, the user will only be
     // prompted to add a description to the first commit, which will use the
@@ -523,7 +538,7 @@ fn test_split_parallel_no_descendants() {
     // - The rewritten commit from the snapshot after the files were added.
     // - The rewritten commit after the split.
     let evolog_1 = work_dir.run_jj(["evolog", "-r", "qpvun"]);
-    insta::assert_snapshot!(evolog_1, @r###"
+    insta::assert_snapshot!(evolog_1, @r#"
     ○  qpvuntsm test.user@example.com 2001-02-03 08:05:09 48018df6
     │  TESTED=TODO
     ○  qpvuntsm hidden test.user@example.com 2001-02-03 08:05:08 44af2155
@@ -531,12 +546,15 @@ fn test_split_parallel_no_descendants() {
     ○  qpvuntsm hidden test.user@example.com 2001-02-03 08:05:07 230dd059
        (empty) (no description set)
     [EOF]
-    "###);
+    ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
+    [EOF]
+    "#);
 
     // The evolog for the second commit is the same, except that the change id
     // changes after the split.
     let evolog_2 = work_dir.run_jj(["evolog", "-r", "kkmpp"]);
-    insta::assert_snapshot!(evolog_2, @r###"
+    insta::assert_snapshot!(evolog_2, @r#"
     @  kkmpptxz test.user@example.com 2001-02-03 08:05:09 7eddbf93
     │  (no description set)
     ○  qpvuntsm hidden test.user@example.com 2001-02-03 08:05:08 44af2155
@@ -544,7 +562,10 @@ fn test_split_parallel_no_descendants() {
     ○  qpvuntsm hidden test.user@example.com 2001-02-03 08:05:07 230dd059
        (empty) (no description set)
     [EOF]
-    "###);
+    ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
+    [EOF]
+    "#);
 }
 
 #[test]
@@ -989,6 +1010,80 @@ fn test_split_with_multiple_workspaces_different_working_copy() {
     ◆  zzzzzzzzzzzz
     [EOF]
     ");
+}
+
+#[test]
+fn test_split_with_non_empty_description_and_trailers() {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_editor();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    test_env.add_config(r#"ui.default-description = "\n\nTESTED=TODO""#);
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("file1", "foo\n");
+    work_dir.write_file("file2", "bar\n");
+    work_dir.run_jj(["describe", "-m", "test"]).success();
+    std::fs::write(
+        edit_script,
+        [
+            "dump editor1",
+            "write\npart 1",
+            "next invocation\n",
+            "dump editor2",
+            "write\npart 2",
+        ]
+        .join("\0"),
+    )
+    .unwrap();
+
+    test_env.add_config(
+        r#"[templates]
+        commit_trailers = '''"Signed-off-by: " ++ committer.email()'''"#,
+    );
+    let output = work_dir.run_jj(["split", "file1"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
+    First part: qpvuntsm 231a3c00 part 1
+    Second part: kkmpptxz e96291aa part 2
+    Working copy  (@) now at: kkmpptxz e96291aa part 2
+    Parent commit (@-)      : qpvuntsm 231a3c00 part 1
+    [EOF]
+    "#);
+
+    insta::assert_snapshot!(
+        std::fs::read_to_string(test_env.env_root().join("editor1")).unwrap(), @r#"
+    JJ: Enter a description for the first commit.
+    test
+
+    Signed-off-by: test.user@example.com
+
+    JJ: This commit contains the following changes:
+    JJ:     A file1
+    JJ:
+    JJ: Lines starting with "JJ:" (like this one) will be removed.
+    "#);
+    insta::assert_snapshot!(
+        std::fs::read_to_string(test_env.env_root().join("editor2")).unwrap(), @r#"
+    JJ: Enter a description for the second commit.
+    test
+
+    Signed-off-by: test.user@example.com
+
+    JJ: This commit contains the following changes:
+    JJ:     A file2
+    JJ:
+    JJ: Lines starting with "JJ:" (like this one) will be removed.
+    "#);
+    insta::assert_snapshot!(get_log_output(&work_dir), @r#"
+    @  kkmpptxzrspx false part 2
+    ○  qpvuntsmwlqt false part 1
+    ◆  zzzzzzzzzzzz true
+    [EOF]
+    ------- stderr -------
+    Warning: Deprecated config: ui.default-description is updated to template-aliases.default_commit_description = '"\n\nTESTED=TODO\n"'
+    [EOF]
+    "#);
 }
 
 enum BookmarkBehavior {

@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
+use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
 use jj_lib::repo::Repo as _;
@@ -28,6 +28,7 @@ use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
 use crate::complete;
+use crate::description_util::add_trailers;
 use crate::description_util::join_message_paragraphs;
 use crate::ui::Ui;
 
@@ -48,7 +49,7 @@ pub(crate) struct NewArgs {
     #[arg(
         default_value = "@",
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::all_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     revisions: Option<Vec<RevisionArg>>,
     /// Ignored (but lets you pass `-d`/`-r` for consistency with other
@@ -65,23 +66,78 @@ pub(crate) struct NewArgs {
     #[arg(long, hide = true)]
     _edit: bool,
     /// Insert the new change after the given commit(s)
+    ///
+    /// Example: `jj new --after A` creates a new change between `A` and its
+    /// children:
+    ///
+    /// ```text
+    ///                 B   C
+    ///                  \ /
+    ///     B   C   =>    @
+    ///      \ /          |
+    ///       A           A
+    /// ```
+    ///
+    /// Specifying `--after` multiple times will relocate all children of the
+    /// given commits.
+    ///
+    /// Example: `jj new --after A --after X` creates a change with `A` and `X`
+    /// as parents, and rebases all children on top of the new change:
+    ///
+    /// ```text
+    ///                 B   Y
+    ///                  \ /
+    ///     B  Y    =>    @
+    ///     |  |         / \
+    ///     A  X        A   X
+    /// ```
     #[arg(
         long,
         short = 'A',
         visible_alias = "after",
         conflicts_with = "revisions",
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::all_revisions),
+        verbatim_doc_comment,
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     insert_after: Option<Vec<RevisionArg>>,
     /// Insert the new change before the given commit(s)
+    ///
+    /// Example: `jj new --before C` creates a new change between `C` and its
+    /// parents:
+    ///
+    /// ```text
+    ///                    C
+    ///                    |
+    ///       C     =>     @
+    ///      / \          / \
+    ///     A   B        A   B
+    /// ```
+    ///
+    /// `--after` and `--before` can be combined.
+    ///
+    /// Example: `jj new --after A --before D`:
+    ///
+    /// ```text
+    /// 
+    ///     D            D
+    ///     |           / \
+    ///     C          |   C
+    ///     |    =>    @   |
+    ///     B          |   B
+    ///     |           \ /
+    ///     A            A
+    /// ```
+    ///
+    /// Similar to `--after`, you can specify `--before` multiple times.
     #[arg(
         long,
         short = 'B',
         visible_alias = "before",
         conflicts_with = "revisions",
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::mutable_revisions),
+        verbatim_doc_comment,
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     insert_before: Option<Vec<RevisionArg>>,
 }
@@ -129,11 +185,21 @@ pub(crate) fn cmd_new(
 
     let mut tx = workspace_command.start_transaction();
     let merged_tree = merge_commit_trees(tx.repo(), &parent_commits)?;
-    let new_commit = tx
+    let mut commit_builder = tx
         .repo_mut()
         .new_commit(parent_commit_ids, merged_tree.id())
-        .set_description(join_message_paragraphs(&args.message_paragraphs))
-        .write()?;
+        .detach();
+    let mut description = join_message_paragraphs(&args.message_paragraphs);
+    if !description.is_empty() {
+        // The first trailer would become the first line of the description.
+        // Also, a commit with no description is treated in a special way in jujutsu: it
+        // can be discarded as soon as it's no longer the working copy. Adding a
+        // trailer to an empty description would break that logic.
+        commit_builder.set_description(description);
+        description = add_trailers(ui, &tx, &commit_builder)?;
+    }
+    commit_builder.set_description(&description);
+    let new_commit = commit_builder.write(tx.repo_mut())?;
 
     let child_commits: Vec<_> = child_commit_ids
         .iter()

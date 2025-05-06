@@ -13,13 +13,17 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use itertools::Itertools as _;
@@ -49,6 +53,7 @@ use jj_lib::repo::RepoLoader;
 use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::repo_path::RepoPathComponent;
 use jj_lib::rewrite::RebaseOptions;
 use jj_lib::rewrite::RebasedCommit;
 use jj_lib::secret_backend::SecretBackend;
@@ -124,6 +129,15 @@ pub fn user_settings() -> UserSettings {
 pub fn ensure_running_outside_ci(reason: &str) {
     let running_in_ci = std::env::var("CI").is_ok_and(|value| !value.is_empty());
     assert!(!running_in_ci, "Running in CI, {reason}.");
+}
+
+/// Tests if an external tool is installed and in the PATH
+pub fn is_external_tool_installed(program_name: impl AsRef<OsStr>) -> bool {
+    Command::new(program_name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 #[derive(Debug)]
@@ -343,6 +357,18 @@ pub fn commit_transactions(txs: Vec<Transaction>) -> Arc<ReadonlyRepo> {
     repo
 }
 
+pub fn repo_path_component(value: &str) -> &RepoPathComponent {
+    RepoPathComponent::new(value).unwrap()
+}
+
+pub fn repo_path(value: &str) -> &RepoPath {
+    RepoPath::from_internal_string(value).unwrap()
+}
+
+pub fn repo_path_buf(value: impl Into<String>) -> RepoPathBuf {
+    RepoPathBuf::from_internal_string(value).unwrap()
+}
+
 pub fn read_file(store: &Store, path: &RepoPath, id: &FileId) -> Vec<u8> {
     let mut reader = store.read_file(path, id).unwrap();
     let mut content = vec![];
@@ -410,7 +436,7 @@ pub fn create_tree(repo: &Arc<ReadonlyRepo>, path_contents: &[(&RepoPath, &str)]
 #[must_use]
 pub fn create_random_tree(repo: &Arc<ReadonlyRepo>) -> MergedTreeId {
     let number = rand::random::<u32>();
-    let path = RepoPathBuf::from_internal_string(format!("file{number}"));
+    let path = repo_path_buf(format!("file{number}"));
     create_tree(repo, &[(&path, "contents")]).id()
 }
 
@@ -597,21 +623,58 @@ pub fn assert_abandoned_with_parent(
 }
 
 pub fn assert_no_forgotten_test_files(test_dir: &Path) {
-    let runner_path = test_dir.join("runner.rs");
-    let runner = fs::read_to_string(&runner_path).unwrap();
-    let entries = fs::read_dir(test_dir).unwrap();
-    for entry in entries {
-        let path = entry.unwrap().path();
-        if let Some(ext) = path.extension() {
-            let name = path.file_stem().unwrap();
-            if ext == "rs" && name != "runner" {
-                let search = format!("mod {};", name.to_str().unwrap());
-                assert!(
-                    runner.contains(&search),
-                    "missing `{search}` declaration in {}",
-                    runner_path.display()
-                );
-            }
-        }
-    }
+    // Parse the integration tests' main modules from the Cargo manifest.
+    let manifest = {
+        let file_path = test_dir.parent().unwrap().join("Cargo.toml");
+        let text = fs::read_to_string(&file_path).unwrap();
+        toml_edit::ImDocument::parse(text).unwrap()
+    };
+    let test_bin_mods = if let Some(item) = manifest.get("test") {
+        let tables = item.as_array_of_tables().unwrap();
+        tables
+            .iter()
+            .map(|test| test.get("name").unwrap().as_str().unwrap().to_owned())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Add to that all submodules which are declared in the main test modules via
+    // `mod`.
+    let mut test_mods: HashSet<_> = test_bin_mods
+        .iter()
+        .flat_map(|test_mod| {
+            let test_mod_path = test_dir.join(test_mod).with_extension("rs");
+            let test_mod_contents = fs::read_to_string(&test_mod_path).unwrap();
+            test_mod_contents
+                .lines()
+                .map(|line| line.trim_start_matches("pub "))
+                .filter_map(|line| line.strip_prefix("mod"))
+                .filter_map(|line| line.strip_suffix(";"))
+                .map(|line| line.trim().to_string())
+                .collect_vec()
+        })
+        .collect();
+    test_mods.extend(test_bin_mods);
+
+    // Gather list of Rust source files in test directory for comparison.
+    let test_mod_files: HashSet<_> = fs::read_dir(test_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_os_string().into_string().ok())
+        })
+        .collect();
+
+    assert!(
+        test_mod_files.is_subset(&test_mods),
+        "the following test source files are not declared as integration tests nor included as \
+         submodules of one: {}",
+        test_mod_files
+            .difference(&test_mods)
+            .map(|mod_stem| format!("{mod_stem}.rs"))
+            .join(", "),
+    );
 }

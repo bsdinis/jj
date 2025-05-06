@@ -2,26 +2,29 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::stream::BoxStream;
 use futures::StreamExt as _;
-use futures::TryFutureExt as _;
-use futures::TryStreamExt as _;
 use itertools::Itertools as _;
 use jj_lib::backend::BackendResult;
 use jj_lib::backend::MergedTreeId;
 use jj_lib::backend::TreeValue;
+use jj_lib::conflicts;
 use jj_lib::conflicts::materialize_merge_result_to_bytes;
-use jj_lib::conflicts::materialize_tree_value;
+use jj_lib::conflicts::materialized_diff_stream;
 use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::conflicts::MaterializedTreeValue;
+use jj_lib::conflicts::MIN_CONFLICT_MARKER_LEN;
+use jj_lib::copies::CopiesTreeDiffEntry;
+use jj_lib::copies::CopyRecords;
 use jj_lib::diff::Diff;
 use jj_lib::diff::DiffHunkKind;
 use jj_lib::files;
 use jj_lib::files::MergeResult;
 use jj_lib::matchers::Matcher;
 use jj_lib::merge::Merge;
+use jj_lib::merge::MergedTreeValue;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree::MergedTreeBuilder;
-use jj_lib::merged_tree::TreeDiffEntry;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
@@ -60,6 +63,23 @@ enum FileContents {
     },
 }
 
+impl FileContents {
+    fn describe(&self) -> Option<String> {
+        match self {
+            FileContents::Absent => None,
+            FileContents::Text {
+                contents: _,
+                hash,
+                num_bytes,
+            }
+            | FileContents::Binary { hash, num_bytes } => match hash {
+                Some(hash) => Some(format!("{hash} ({num_bytes}B)")),
+                None => Some(format!("({num_bytes}B)")),
+            },
+        }
+    }
+}
+
 /// Information about a file that was read from disk. Note that the file may not
 /// have existed, in which case its contents will be marked as absent.
 #[derive(Clone, Debug)]
@@ -81,15 +101,6 @@ mod mode {
     pub const SYMLINK: scm_record::FileMode = scm_record::FileMode::Unix(0o120000);
 }
 
-fn describe_binary(hash: Option<&str>, num_bytes: u64) -> String {
-    match hash {
-        Some(hash) => {
-            format!("{hash} ({num_bytes}B)")
-        }
-        None => format!("({num_bytes}B)"),
-    }
-}
-
 fn buf_to_file_contents(hash: Option<String>, buf: Vec<u8>) -> FileContents {
     let num_bytes: u64 = buf.len().try_into().unwrap();
     let text = if buf.contains(&0) {
@@ -108,15 +119,10 @@ fn buf_to_file_contents(hash: Option<String>, buf: Vec<u8>) -> FileContents {
 }
 
 fn read_file_contents(
-    store: &Store,
-    tree: &MergedTree,
+    materialized_value: MaterializedTreeValue,
     path: &RepoPath,
     conflict_marker_style: ConflictMarkerStyle,
 ) -> Result<FileInfo, BuiltinToolError> {
-    let value = tree.path_value(path)?;
-    let materialized_value = materialize_tree_value(store, path, value)
-        .map_err(BuiltinToolError::BackendError)
-        .block_on()?;
     match materialized_value {
         MaterializedTreeValue::Absent => Ok(FileInfo {
             file_mode: mode::ABSENT,
@@ -165,12 +171,12 @@ fn read_file_contents(
             item: "git submodule",
             id: id.hex(),
         }),
-        MaterializedTreeValue::FileConflict {
-            id: _,
-            contents,
-            executable: _,
-        } => {
-            let buf = materialize_merge_result_to_bytes(&contents, conflict_marker_style).into();
+        MaterializedTreeValue::FileConflict(file) => {
+            // Since scm_record doesn't support diffs of conflicts, file
+            // conflicts are compared in materialized form. The UI would look
+            // scary, but it can at least allow squashing resolved hunks.
+            let buf =
+                materialize_merge_result_to_bytes(&file.contents, conflict_marker_style).into();
             // TODO: Render the ID somehow?
             let contents = buf_to_file_contents(None, buf);
             Ok(FileInfo {
@@ -179,6 +185,7 @@ fn read_file_contents(
             })
         }
         MaterializedTreeValue::OtherConflict { id } => {
+            // TODO: Non-file conflict shouldn't be rendered as a normal file
             // TODO: Render the ID somehow?
             let contents = buf_to_file_contents(None, id.describe().into_bytes());
             Ok(FileInfo {
@@ -252,18 +259,20 @@ fn make_diff_sections(
     Ok(sections)
 }
 
-pub fn make_diff_files(
+async fn make_diff_files(
     store: &Arc<Store>,
-    left_tree: &MergedTree,
-    right_tree: &MergedTree,
-    changed_files: &[RepoPathBuf],
+    tree_diff: BoxStream<'_, CopiesTreeDiffEntry>,
     conflict_marker_style: ConflictMarkerStyle,
-) -> Result<Vec<scm_record::File<'static>>, BuiltinToolError> {
+) -> Result<(Vec<RepoPathBuf>, Vec<scm_record::File<'static>>), BuiltinToolError> {
+    let mut diff_stream = materialized_diff_stream(store, tree_diff);
+    let mut changed_files = Vec::new();
     let mut files = Vec::new();
-    for changed_path in changed_files {
-        let left_info = read_file_contents(store, left_tree, changed_path, conflict_marker_style)?;
-        let right_info =
-            read_file_contents(store, right_tree, changed_path, conflict_marker_style)?;
+    while let Some(entry) = diff_stream.next().await {
+        let left_path = entry.path.source();
+        let right_path = entry.path.target();
+        let (left_value, right_value) = entry.values?;
+        let left_info = read_file_contents(left_value, left_path, conflict_marker_style)?;
+        let right_info = read_file_contents(right_value, right_path, conflict_marker_style)?;
         let mut sections = Vec::new();
 
         if left_info.file_mode != right_info.file_mode {
@@ -306,14 +315,6 @@ pub fn make_diff_files(
                 lines: make_section_changed_lines(&contents, scm_record::ChangeType::Added),
             }),
 
-            (FileContents::Absent, FileContents::Binary { hash, num_bytes }) => {
-                sections.push(scm_record::Section::Binary {
-                    is_checked: false,
-                    old_description: None,
-                    new_description: Some(Cow::Owned(describe_binary(hash.as_deref(), num_bytes))),
-                });
-            }
-
             (
                 FileContents::Text {
                     contents,
@@ -340,42 +341,12 @@ pub fn make_diff_files(
                 sections.extend(make_diff_sections(&old_contents, &new_contents)?);
             }
 
-            (
-                FileContents::Text {
-                    contents: _,
-                    hash: old_hash,
-                    num_bytes: old_num_bytes,
-                }
-                | FileContents::Binary {
-                    hash: old_hash,
-                    num_bytes: old_num_bytes,
-                },
-                FileContents::Text {
-                    contents: _,
-                    hash: new_hash,
-                    num_bytes: new_num_bytes,
-                }
-                | FileContents::Binary {
-                    hash: new_hash,
-                    num_bytes: new_num_bytes,
-                },
-            ) => sections.push(scm_record::Section::Binary {
-                is_checked: false,
-                old_description: Some(Cow::Owned(describe_binary(
-                    old_hash.as_deref(),
-                    old_num_bytes,
-                ))),
-                new_description: Some(Cow::Owned(describe_binary(
-                    new_hash.as_deref(),
-                    new_num_bytes,
-                ))),
-            }),
-
-            (FileContents::Binary { hash, num_bytes }, FileContents::Absent) => {
+            (left, right @ FileContents::Binary { .. })
+            | (left @ FileContents::Binary { .. }, right) => {
                 sections.push(scm_record::Section::Binary {
                     is_checked: false,
-                    old_description: Some(Cow::Owned(describe_binary(hash.as_deref(), num_bytes))),
-                    new_description: None,
+                    old_description: left.describe().map(Cow::Owned),
+                    new_description: right.describe().map(Cow::Owned),
                 });
             }
         }
@@ -383,22 +354,65 @@ pub fn make_diff_files(
         files.push(scm_record::File {
             old_path: None,
             // Path for displaying purposes, not for file access.
-            path: Cow::Owned(changed_path.to_fs_path_unchecked(Path::new(""))),
+            path: Cow::Owned(right_path.to_fs_path_unchecked(Path::new(""))),
             file_mode: left_info.file_mode,
             sections,
         });
+        changed_files.push(entry.path.target);
     }
-    Ok(files)
+    Ok((changed_files, files))
 }
 
-pub fn apply_diff_builtin(
+fn apply_diff_builtin(
     store: &Arc<Store>,
     left_tree: &MergedTree,
     right_tree: &MergedTree,
     changed_files: Vec<RepoPathBuf>,
     files: &[scm_record::File],
+    conflict_marker_style: ConflictMarkerStyle,
 ) -> BackendResult<MergedTreeId> {
     let mut tree_builder = MergedTreeBuilder::new(left_tree.id().clone());
+    apply_changes(
+        &mut tree_builder,
+        changed_files,
+        files,
+        |path| right_tree.path_value(path),
+        |path, contents, executable| {
+            let old_value = left_tree.path_value(path)?;
+            let new_value = if old_value.is_resolved() {
+                let id = store.write_file(path, &mut &contents[..]).block_on()?;
+                Merge::normal(TreeValue::File { id, executable })
+            } else if let Some(old_file_ids) = old_value.to_file_merge() {
+                // TODO: should error out if conflicts couldn't be parsed?
+                let new_file_ids = conflicts::update_from_content(
+                    &old_file_ids,
+                    store,
+                    path,
+                    contents,
+                    conflict_marker_style,
+                    MIN_CONFLICT_MARKER_LEN, // TODO: use the materialization parameter
+                )
+                .block_on()?;
+                match new_file_ids.into_resolved() {
+                    Ok(id) => Merge::resolved(id.map(|id| TreeValue::File { id, executable })),
+                    Err(file_ids) => old_value.with_new_file_ids(&file_ids),
+                }
+            } else {
+                panic!("unexpected content change at {path:?}: {old_value:?}");
+            };
+            Ok(new_value)
+        },
+    )?;
+    tree_builder.write_tree(store)
+}
+
+fn apply_changes(
+    tree_builder: &mut MergedTreeBuilder,
+    changed_files: Vec<RepoPathBuf>,
+    files: &[scm_record::File],
+    select_right: impl Fn(&RepoPath) -> BackendResult<MergedTreeValue>,
+    write_file: impl Fn(&RepoPath, &[u8], bool) -> BackendResult<MergedTreeValue>,
+) -> BackendResult<()> {
     assert_eq!(
         changed_files.len(),
         files.len(),
@@ -429,27 +443,17 @@ pub fn apply_diff_builtin(
                 old_description: _,
                 new_description: _,
             } => {
-                let value = right_tree.path_value(&path)?;
+                let value = select_right(&path)?;
                 tree_builder.set_or_remove(path, value);
             }
             scm_record::SelectedContents::Text { contents } => {
-                let file_id = store
-                    .write_file(&path, &mut contents.as_bytes())
-                    .block_on()?;
-
-                tree_builder.set_or_remove(
-                    path,
-                    Merge::normal(TreeValue::File {
-                        id: file_id,
-                        executable: file_mode == mode::EXECUTABLE,
-                    }),
-                );
+                let executable = file_mode == mode::EXECUTABLE;
+                let value = write_file(&path, contents.as_bytes(), executable)?;
+                tree_builder.set_or_remove(path, value);
             }
         }
     }
-
-    let tree_id = tree_builder.write_tree(left_tree.store())?;
-    Ok(tree_id)
+    Ok(())
 }
 
 pub fn edit_diff_builtin(
@@ -460,18 +464,10 @@ pub fn edit_diff_builtin(
 ) -> Result<MergedTreeId, BuiltinToolError> {
     let store = left_tree.store().clone();
     // TODO: handle copy tracking
-    let changed_files: Vec<_> = left_tree
-        .diff_stream(right_tree, matcher)
-        .map(|TreeDiffEntry { path, values }| values.map(|_| path))
-        .try_collect()
-        .block_on()?;
-    let files = make_diff_files(
-        &store,
-        left_tree,
-        right_tree,
-        &changed_files,
-        conflict_marker_style,
-    )?;
+    let copy_records = CopyRecords::default();
+    let tree_diff = left_tree.diff_stream_with_copies(right_tree, matcher, &copy_records);
+    let (changed_files, files) =
+        make_diff_files(&store, tree_diff, conflict_marker_style).block_on()?;
     let mut input = scm_record::helpers::CrosstermInput;
     let recorder = scm_record::Recorder::new(
         scm_record::RecordState {
@@ -482,8 +478,15 @@ pub fn edit_diff_builtin(
         &mut input,
     );
     let result = recorder.run().map_err(BuiltinToolError::Record)?;
-    let tree_id = apply_diff_builtin(&store, left_tree, right_tree, changed_files, &result.files)
-        .map_err(BuiltinToolError::BackendError)?;
+    let tree_id = apply_diff_builtin(
+        &store,
+        left_tree,
+        right_tree,
+        changed_files,
+        &result.files,
+        conflict_marker_style,
+    )
+    .map_err(BuiltinToolError::BackendError)?;
     Ok(tree_id)
 }
 
@@ -506,10 +509,11 @@ fn make_merge_sections(
                         .map(|line| Cow::Owned(line.to_owned()))
                         .collect(),
                 }),
-                FileContents::Binary { hash, num_bytes } => Some(scm_record::Section::Binary {
+                FileContents::Binary { .. } => Some(scm_record::Section::Binary {
+                    // TODO: Perhaps, this should be an "unchanged" section?
                     is_checked: false,
                     old_description: None,
-                    new_description: Some(Cow::Owned(describe_binary(hash.as_deref(), num_bytes))),
+                    new_description: contents.describe().map(Cow::Owned),
                 }),
             };
             if let Some(section) = section {
@@ -570,7 +574,15 @@ fn make_merge_sections(
 fn make_merge_file(
     merge_tool_file: &MergeToolFile,
 ) -> Result<scm_record::File<'static>, BuiltinToolError> {
-    let merge_result = files::merge_hunks(&merge_tool_file.simplified_file_content);
+    let file = &merge_tool_file.file;
+    let file_mode = if file.executable.expect("should have been resolved") {
+        mode::EXECUTABLE
+    } else {
+        mode::NORMAL
+    };
+    // TODO: Maybe we should test binary contents here, and generate per-file
+    // Binary section to select either "our" or "their" file.
+    let merge_result = files::merge_hunks(&file.contents);
     let sections = make_merge_sections(merge_result)?;
     Ok(scm_record::File {
         old_path: None,
@@ -580,7 +592,7 @@ fn make_merge_file(
                 .repo_path
                 .to_fs_path_unchecked(Path::new("")),
         ),
-        file_mode: mode::NORMAL,
+        file_mode,
         sections,
     })
 }
@@ -600,42 +612,80 @@ pub fn edit_merge_builtin(
     );
     let state = recorder.run()?;
 
-    apply_diff_builtin(
-        tree.store(),
-        tree,
-        tree,
+    let store = tree.store();
+    let mut tree_builder = MergedTreeBuilder::new(tree.id().clone());
+    apply_changes(
+        &mut tree_builder,
         merge_tool_files
             .iter()
             .map(|file| file.repo_path.clone())
             .collect_vec(),
         &state.files,
-    )
-    .map_err(BuiltinToolError::BackendError)
+        // TODO: It doesn't make sense to select new value from the source tree.
+        // Perhaps, "their" tree value should be extracted from a conflict?
+        |path| tree.path_value(path),
+        |path, contents, executable| {
+            let id = store.write_file(path, &mut &contents[..]).block_on()?;
+            Ok(Merge::normal(TreeValue::File { id, executable }))
+        },
+    )?;
+    Ok(tree_builder.write_tree(store)?)
 }
 
 #[cfg(test)]
 mod tests {
     use jj_lib::backend::FileId;
     use jj_lib::conflicts::extract_as_single_hunk;
+    use jj_lib::matchers::EverythingMatcher;
     use jj_lib::merge::MergedTreeValue;
     use jj_lib::repo::Repo as _;
+    use testutils::repo_path;
     use testutils::TestRepo;
 
     use super::*;
+
+    fn make_diff(
+        store: &Arc<Store>,
+        left_tree: &MergedTree,
+        right_tree: &MergedTree,
+    ) -> (Vec<RepoPathBuf>, Vec<scm_record::File<'static>>) {
+        let copy_records = CopyRecords::default();
+        let tree_diff =
+            left_tree.diff_stream_with_copies(right_tree, &EverythingMatcher, &copy_records);
+        make_diff_files(store, tree_diff, ConflictMarkerStyle::Diff)
+            .block_on()
+            .unwrap()
+    }
+
+    fn apply_diff(
+        store: &Arc<Store>,
+        left_tree: &MergedTree,
+        right_tree: &MergedTree,
+        changed_files: &[RepoPathBuf],
+        files: &[scm_record::File],
+    ) -> MergedTreeId {
+        apply_diff_builtin(
+            store,
+            left_tree,
+            right_tree,
+            changed_files.to_vec(),
+            files,
+            ConflictMarkerStyle::Diff,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_edit_diff_builtin() {
         let test_repo = TestRepo::init();
         let store = test_repo.repo.store();
 
-        let unused_path = RepoPath::from_internal_string("unused");
-        let unchanged = RepoPath::from_internal_string("unchanged");
-        let changed_path = RepoPath::from_internal_string("changed");
-        let added_path = RepoPath::from_internal_string("added");
+        let unchanged = repo_path("unchanged");
+        let changed_path = repo_path("changed");
+        let added_path = repo_path("added");
         let left_tree = testutils::create_tree(
             &test_repo.repo,
             &[
-                (unused_path, "unused\n"),
                 (unchanged, "unchanged\n"),
                 (changed_path, "line1\nline2\nline3\n"),
             ],
@@ -643,38 +693,39 @@ mod tests {
         let right_tree = testutils::create_tree(
             &test_repo.repo,
             &[
-                (unused_path, "unused\n"),
                 (unchanged, "unchanged\n"),
                 (changed_path, "line1\nchanged1\nchanged2\nline3\nadded1\n"),
                 (added_path, "added\n"),
             ],
         );
 
-        let changed_files = vec![
-            unchanged.to_owned(),
-            changed_path.to_owned(),
-            added_path.to_owned(),
-        ];
-        let files = make_diff_files(
-            store,
-            &left_tree,
-            &right_tree,
-            &changed_files,
-            ConflictMarkerStyle::Diff,
-        )
-        .unwrap();
+        let (changed_files, files) = make_diff(store, &left_tree, &right_tree);
+        insta::assert_debug_snapshot!(changed_files, @r#"
+        [
+            "added",
+            "changed",
+        ]
+        "#);
         insta::assert_debug_snapshot!(files, @r#"
         [
             File {
                 old_path: None,
-                path: "unchanged",
-                file_mode: Unix(
-                    33188,
-                ),
+                path: "added",
+                file_mode: Absent,
                 sections: [
-                    Unchanged {
+                    FileMode {
+                        is_checked: false,
+                        mode: Unix(
+                            33188,
+                        ),
+                    },
+                    Changed {
                         lines: [
-                            "unchanged\n",
+                            SectionChangedLine {
+                                is_checked: false,
+                                change_type: Added,
+                                line: "added\n",
+                            },
                         ],
                     },
                 ],
@@ -726,39 +777,10 @@ mod tests {
                     },
                 ],
             },
-            File {
-                old_path: None,
-                path: "added",
-                file_mode: Absent,
-                sections: [
-                    FileMode {
-                        is_checked: false,
-                        mode: Unix(
-                            33188,
-                        ),
-                    },
-                    Changed {
-                        lines: [
-                            SectionChangedLine {
-                                is_checked: false,
-                                change_type: Added,
-                                line: "added\n",
-                            },
-                        ],
-                    },
-                ],
-            },
         ]
         "#);
 
-        let no_changes_tree_id = apply_diff_builtin(
-            store,
-            &left_tree,
-            &right_tree,
-            changed_files.clone(),
-            &files,
-        )
-        .unwrap();
+        let no_changes_tree_id = apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let no_changes_tree = store.get_root_tree(&no_changes_tree_id).unwrap();
         assert_eq!(
             no_changes_tree.id(),
@@ -771,7 +793,7 @@ mod tests {
             file.toggle_all();
         }
         let all_changes_tree_id =
-            apply_diff_builtin(store, &left_tree, &right_tree, changed_files, &files).unwrap();
+            apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let all_changes_tree = store.get_root_tree(&all_changes_tree_id).unwrap();
         assert_eq!(
             all_changes_tree.id(),
@@ -785,19 +807,16 @@ mod tests {
         let test_repo = TestRepo::init();
         let store = test_repo.repo.store();
 
-        let added_empty_file_path = RepoPath::from_internal_string("empty_file");
+        let added_empty_file_path = repo_path("empty_file");
         let left_tree = testutils::create_tree(&test_repo.repo, &[]);
         let right_tree = testutils::create_tree(&test_repo.repo, &[(added_empty_file_path, "")]);
 
-        let changed_files = vec![added_empty_file_path.to_owned()];
-        let files = make_diff_files(
-            store,
-            &left_tree,
-            &right_tree,
-            &changed_files,
-            ConflictMarkerStyle::Diff,
-        )
-        .unwrap();
+        let (changed_files, files) = make_diff(store, &left_tree, &right_tree);
+        insta::assert_debug_snapshot!(changed_files, @r#"
+        [
+            "empty_file",
+        ]
+        "#);
         insta::assert_debug_snapshot!(files, @r#"
         [
             File {
@@ -815,14 +834,7 @@ mod tests {
             },
         ]
         "#);
-        let no_changes_tree_id = apply_diff_builtin(
-            store,
-            &left_tree,
-            &right_tree,
-            changed_files.clone(),
-            &files,
-        )
-        .unwrap();
+        let no_changes_tree_id = apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let no_changes_tree = store.get_root_tree(&no_changes_tree_id).unwrap();
         assert_eq!(
             no_changes_tree.id(),
@@ -835,7 +847,7 @@ mod tests {
             file.toggle_all();
         }
         let all_changes_tree_id =
-            apply_diff_builtin(store, &left_tree, &right_tree, changed_files, &files).unwrap();
+            apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let all_changes_tree = store.get_root_tree(&all_changes_tree_id).unwrap();
         assert_eq!(
             all_changes_tree.id(),
@@ -849,7 +861,7 @@ mod tests {
         let test_repo = TestRepo::init();
         let store = test_repo.repo.store();
 
-        let added_executable_file_path = RepoPath::from_internal_string("executable_file");
+        let added_executable_file_path = repo_path("executable_file");
         let left_tree = testutils::create_tree(&test_repo.repo, &[]);
         let right_tree = {
             // let store = test_repo.repo.store();
@@ -863,15 +875,12 @@ mod tests {
             MergedTree::resolved(store.get_tree(RepoPathBuf::root(), &id).unwrap())
         };
 
-        let changed_files = vec![added_executable_file_path.to_owned()];
-        let files = make_diff_files(
-            store,
-            &left_tree,
-            &right_tree,
-            &changed_files,
-            ConflictMarkerStyle::Diff,
-        )
-        .unwrap();
+        let (changed_files, files) = make_diff(store, &left_tree, &right_tree);
+        insta::assert_debug_snapshot!(changed_files, @r#"
+        [
+            "executable_file",
+        ]
+        "#);
         insta::assert_debug_snapshot!(files, @r###"
         [
             File {
@@ -898,14 +907,7 @@ mod tests {
             },
         ]
         "###);
-        let no_changes_tree_id = apply_diff_builtin(
-            store,
-            &left_tree,
-            &right_tree,
-            changed_files.clone(),
-            &files,
-        )
-        .unwrap();
+        let no_changes_tree_id = apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let no_changes_tree = store.get_root_tree(&no_changes_tree_id).unwrap();
         assert_eq!(
             no_changes_tree.id(),
@@ -918,7 +920,7 @@ mod tests {
             file.toggle_all();
         }
         let all_changes_tree_id =
-            apply_diff_builtin(store, &left_tree, &right_tree, changed_files, &files).unwrap();
+            apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let all_changes_tree = store.get_root_tree(&all_changes_tree_id).unwrap();
         assert_eq!(
             all_changes_tree.id(),
@@ -932,19 +934,16 @@ mod tests {
         let test_repo = TestRepo::init();
         let store = test_repo.repo.store();
 
-        let file_path = RepoPath::from_internal_string("file_with_content");
+        let file_path = repo_path("file_with_content");
         let left_tree = testutils::create_tree(&test_repo.repo, &[(file_path, "content\n")]);
         let right_tree = testutils::create_tree(&test_repo.repo, &[]);
 
-        let changed_files = vec![file_path.to_owned()];
-        let files = make_diff_files(
-            store,
-            &left_tree,
-            &right_tree,
-            &changed_files,
-            ConflictMarkerStyle::Diff,
-        )
-        .unwrap();
+        let (changed_files, files) = make_diff(store, &left_tree, &right_tree);
+        insta::assert_debug_snapshot!(changed_files, @r#"
+        [
+            "file_with_content",
+        ]
+        "#);
         insta::assert_debug_snapshot!(files, @r###"
         [
             File {
@@ -971,14 +970,7 @@ mod tests {
             },
         ]
         "###);
-        let no_changes_tree_id = apply_diff_builtin(
-            store,
-            &left_tree,
-            &right_tree,
-            changed_files.clone(),
-            &files,
-        )
-        .unwrap();
+        let no_changes_tree_id = apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let no_changes_tree = store.get_root_tree(&no_changes_tree_id).unwrap();
         assert_eq!(
             no_changes_tree.id(),
@@ -991,7 +983,7 @@ mod tests {
             file.toggle_all();
         }
         let all_changes_tree_id =
-            apply_diff_builtin(store, &left_tree, &right_tree, changed_files, &files).unwrap();
+            apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let all_changes_tree = store.get_root_tree(&all_changes_tree_id).unwrap();
         assert_eq!(
             all_changes_tree.id(),
@@ -1005,19 +997,16 @@ mod tests {
         let test_repo = TestRepo::init();
         let store = test_repo.repo.store();
 
-        let added_empty_file_path = RepoPath::from_internal_string("empty_file");
+        let added_empty_file_path = repo_path("empty_file");
         let left_tree = testutils::create_tree(&test_repo.repo, &[(added_empty_file_path, "")]);
         let right_tree = testutils::create_tree(&test_repo.repo, &[]);
 
-        let changed_files = vec![added_empty_file_path.to_owned()];
-        let files = make_diff_files(
-            store,
-            &left_tree,
-            &right_tree,
-            &changed_files,
-            ConflictMarkerStyle::Diff,
-        )
-        .unwrap();
+        let (changed_files, files) = make_diff(store, &left_tree, &right_tree);
+        insta::assert_debug_snapshot!(changed_files, @r#"
+        [
+            "empty_file",
+        ]
+        "#);
         insta::assert_debug_snapshot!(files, @r#"
         [
             File {
@@ -1035,14 +1024,7 @@ mod tests {
             },
         ]
         "#);
-        let no_changes_tree_id = apply_diff_builtin(
-            store,
-            &left_tree,
-            &right_tree,
-            changed_files.clone(),
-            &files,
-        )
-        .unwrap();
+        let no_changes_tree_id = apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let no_changes_tree = store.get_root_tree(&no_changes_tree_id).unwrap();
         assert_eq!(
             no_changes_tree.id(),
@@ -1055,7 +1037,7 @@ mod tests {
             file.toggle_all();
         }
         let all_changes_tree_id =
-            apply_diff_builtin(store, &left_tree, &right_tree, changed_files, &files).unwrap();
+            apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let all_changes_tree = store.get_root_tree(&all_changes_tree_id).unwrap();
         assert_eq!(
             all_changes_tree.id(),
@@ -1069,20 +1051,17 @@ mod tests {
         let test_repo = TestRepo::init();
         let store = test_repo.repo.store();
 
-        let empty_file_path = RepoPath::from_internal_string("empty_file");
+        let empty_file_path = repo_path("empty_file");
         let left_tree = testutils::create_tree(&test_repo.repo, &[(empty_file_path, "")]);
         let right_tree =
             testutils::create_tree(&test_repo.repo, &[(empty_file_path, "modified\n")]);
 
-        let changed_files = vec![empty_file_path.to_owned()];
-        let files = make_diff_files(
-            store,
-            &left_tree,
-            &right_tree,
-            &changed_files,
-            ConflictMarkerStyle::Diff,
-        )
-        .unwrap();
+        let (changed_files, files) = make_diff(store, &left_tree, &right_tree);
+        insta::assert_debug_snapshot!(changed_files, @r#"
+        [
+            "empty_file",
+        ]
+        "#);
         insta::assert_debug_snapshot!(files, @r#"
         [
             File {
@@ -1105,14 +1084,7 @@ mod tests {
             },
         ]
         "#);
-        let no_changes_tree_id = apply_diff_builtin(
-            store,
-            &left_tree,
-            &right_tree,
-            changed_files.clone(),
-            &files,
-        )
-        .unwrap();
+        let no_changes_tree_id = apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let no_changes_tree = store.get_root_tree(&no_changes_tree_id).unwrap();
         assert_eq!(
             no_changes_tree.id(),
@@ -1125,7 +1097,7 @@ mod tests {
             file.toggle_all();
         }
         let all_changes_tree_id =
-            apply_diff_builtin(store, &left_tree, &right_tree, changed_files, &files).unwrap();
+            apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let all_changes_tree = store.get_root_tree(&all_changes_tree_id).unwrap();
         assert_eq!(
             all_changes_tree.id(),
@@ -1139,19 +1111,16 @@ mod tests {
         let test_repo = TestRepo::init();
         let store = test_repo.repo.store();
 
-        let file_path = RepoPath::from_internal_string("file_with_content");
+        let file_path = repo_path("file_with_content");
         let left_tree = testutils::create_tree(&test_repo.repo, &[(file_path, "content\n")]);
         let right_tree = testutils::create_tree(&test_repo.repo, &[(file_path, "")]);
 
-        let changed_files = vec![file_path.to_owned()];
-        let files = make_diff_files(
-            store,
-            &left_tree,
-            &right_tree,
-            &changed_files,
-            ConflictMarkerStyle::Diff,
-        )
-        .unwrap();
+        let (changed_files, files) = make_diff(store, &left_tree, &right_tree);
+        insta::assert_debug_snapshot!(changed_files, @r#"
+        [
+            "file_with_content",
+        ]
+        "#);
         insta::assert_debug_snapshot!(files, @r###"
         [
             File {
@@ -1174,14 +1143,7 @@ mod tests {
             },
         ]
         "###);
-        let no_changes_tree_id = apply_diff_builtin(
-            store,
-            &left_tree,
-            &right_tree,
-            changed_files.clone(),
-            &files,
-        )
-        .unwrap();
+        let no_changes_tree_id = apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let no_changes_tree = store.get_root_tree(&no_changes_tree_id).unwrap();
         assert_eq!(
             no_changes_tree.id(),
@@ -1194,7 +1156,101 @@ mod tests {
             file.toggle_all();
         }
         let all_changes_tree_id =
-            apply_diff_builtin(store, &left_tree, &right_tree, changed_files, &files).unwrap();
+            apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
+        let all_changes_tree = store.get_root_tree(&all_changes_tree_id).unwrap();
+        assert_eq!(
+            all_changes_tree.id(),
+            right_tree.id(),
+            "all-changes tree was different",
+        );
+    }
+
+    #[test]
+    fn test_edit_diff_builtin_conflict_file() {
+        let test_repo = TestRepo::init();
+        let store = test_repo.repo.store();
+
+        let file_path = repo_path("file");
+        let left_tree = {
+            let base = testutils::create_single_tree(&test_repo.repo, &[(file_path, "")]);
+            let left = testutils::create_single_tree(&test_repo.repo, &[(file_path, "1\n")]);
+            let right = testutils::create_single_tree(&test_repo.repo, &[(file_path, "2\n")]);
+            MergedTree::new(Merge::from_vec(vec![left, base, right]))
+        };
+        let right_tree = testutils::create_tree(&test_repo.repo, &[(file_path, "resolved\n")]);
+
+        let (changed_files, files) = make_diff(store, &left_tree, &right_tree);
+        insta::assert_debug_snapshot!(changed_files, @r#"
+        [
+            "file",
+        ]
+        "#);
+        insta::assert_debug_snapshot!(files, @r#"
+        [
+            File {
+                old_path: None,
+                path: "file",
+                file_mode: Unix(
+                    33188,
+                ),
+                sections: [
+                    Changed {
+                        lines: [
+                            SectionChangedLine {
+                                is_checked: false,
+                                change_type: Removed,
+                                line: "<<<<<<< Conflict 1 of 1\n",
+                            },
+                            SectionChangedLine {
+                                is_checked: false,
+                                change_type: Removed,
+                                line: "%%%%%%% Changes from base to side #1\n",
+                            },
+                            SectionChangedLine {
+                                is_checked: false,
+                                change_type: Removed,
+                                line: "+1\n",
+                            },
+                            SectionChangedLine {
+                                is_checked: false,
+                                change_type: Removed,
+                                line: "+++++++ Contents of side #2\n",
+                            },
+                            SectionChangedLine {
+                                is_checked: false,
+                                change_type: Removed,
+                                line: "2\n",
+                            },
+                            SectionChangedLine {
+                                is_checked: false,
+                                change_type: Removed,
+                                line: ">>>>>>> Conflict 1 of 1 ends\n",
+                            },
+                            SectionChangedLine {
+                                is_checked: false,
+                                change_type: Added,
+                                line: "resolved\n",
+                            },
+                        ],
+                    },
+                ],
+            },
+        ]
+        "#);
+        let no_changes_tree_id = apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
+        let no_changes_tree = store.get_root_tree(&no_changes_tree_id).unwrap();
+        assert_eq!(
+            no_changes_tree.id(),
+            left_tree.id(),
+            "no-changes tree was different",
+        );
+
+        let mut files = files;
+        for file in &mut files {
+            file.toggle_all();
+        }
+        let all_changes_tree_id =
+            apply_diff(store, &left_tree, &right_tree, &changed_files, &files);
         let all_changes_tree = store.get_root_tree(&all_changes_tree_id).unwrap();
         assert_eq!(
             all_changes_tree.id(),
@@ -1208,7 +1264,7 @@ mod tests {
         let test_repo = TestRepo::init();
         let store = test_repo.repo.store();
 
-        let path = RepoPath::from_internal_string("file");
+        let path = repo_path("file");
         let base_tree = testutils::create_tree(
             &test_repo.repo,
             &[(path, "base 1\nbase 2\nbase 3\nbase 4\nbase 5\n")],

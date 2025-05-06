@@ -560,10 +560,10 @@ fn abandon_unreachable_commits(
         .intersection(&RevsetExpression::visible_heads().ancestors());
     let abandoned_commit_ids: Vec<_> = abandoned_expression
         .evaluate(mut_repo)
-        .map_err(|err| err.expect_backend_error())?
+        .map_err(|err| err.into_backend_error())?
         .iter()
         .try_collect()
-        .map_err(|err| err.expect_backend_error())?;
+        .map_err(|err| err.into_backend_error())?;
     for id in &abandoned_commit_ids {
         let commit = mut_repo.store().get_commit(id)?;
         mut_repo.record_abandoned_commit(&commit);
@@ -1658,6 +1658,29 @@ fn save_git_config(config: &gix::config::File) -> std::io::Result<()> {
     config.write_to_filter(&mut config_file, |section| section.meta() == config.meta())
 }
 
+fn save_remote(
+    config: &mut gix::config::File<'static>,
+    remote_name: &RemoteName,
+    remote: &mut gix::Remote,
+) -> Result<(), GitRemoteManagementError> {
+    // Work around the gitoxide remote management bug
+    // <https://github.com/GitoxideLabs/gitoxide/issues/1951> by adding
+    // an empty section.
+    //
+    // Note that this will produce useless empty sections if we ever
+    // support remote configuration keys other than `fetch` and `url`.
+    config
+        .new_section(
+            "remote",
+            Some(Cow::Owned(BString::from(remote_name.as_str()))),
+        )
+        .map_err(GitRemoteManagementError::from_git)?;
+    remote
+        .save_as_to(remote_name.as_str(), config)
+        .map_err(GitRemoteManagementError::from_git)?;
+    Ok(())
+}
+
 fn git_config_branch_section_ids_by_remote(
     config: &gix::config::File,
     remote_name: &RemoteName,
@@ -1794,9 +1817,7 @@ pub fn add_remote(
         .expect("default refspec to be valid");
 
     let mut config = git_repo.config_snapshot().clone();
-    remote
-        .save_as_to(remote_name.as_str(), &mut config)
-        .map_err(GitRemoteManagementError::from_git)?;
+    save_remote(&mut config, remote_name, &mut remote)?;
     save_git_config(&config).map_err(GitRemoteManagementError::GitConfigSaveError)?;
 
     Ok(())
@@ -1901,9 +1922,7 @@ pub fn rename_remote(
         .expect("default refspec to be valid");
 
     let mut config = git_repo.config_snapshot().clone();
-    remote
-        .save_as_to(new_remote_name.as_str(), &mut config)
-        .map_err(GitRemoteManagementError::from_git)?;
+    save_remote(&mut config, new_remote_name, &mut remote)?;
     rename_remote_in_git_branch_config_sections(&mut config, old_remote_name, new_remote_name)?;
     remove_remote_git_config_sections(&mut config, old_remote_name)?;
     save_git_config(&config).map_err(GitRemoteManagementError::GitConfigSaveError)?;
@@ -2017,9 +2036,7 @@ pub fn set_remote_url(
         .map_err(GitRemoteManagementError::from_git)?;
 
     let mut config = git_repo.config_snapshot().clone();
-    remote
-        .save_as_to(remote_name.as_str(), &mut config)
-        .map_err(GitRemoteManagementError::from_git)?;
+    save_remote(&mut config, remote_name, &mut remote)?;
     save_git_config(&config).map_err(GitRemoteManagementError::GitConfigSaveError)?;
 
     Ok(())

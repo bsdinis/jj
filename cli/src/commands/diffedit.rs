@@ -14,7 +14,7 @@
 
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
+use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::object_id::ObjectId as _;
@@ -54,7 +54,7 @@ pub(crate) struct DiffeditArgs {
         long,
         short,
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     revision: Option<RevisionArg>,
     /// Show changes from this revision
@@ -64,7 +64,7 @@ pub(crate) struct DiffeditArgs {
         long, short,
         conflicts_with = "revision",
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::all_revisions),
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     from: Option<RevisionArg>,
     /// Edit changes in this revision
@@ -74,7 +74,7 @@ pub(crate) struct DiffeditArgs {
         long, short,
         conflicts_with = "revision",
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::mutable_revisions),
+        add = ArgValueCompleter::new(complete::revset_expression_mutable),
     )]
     to: Option<RevisionArg>,
     /// Specify diff editor to be used
@@ -136,8 +136,7 @@ don't make any changes, then the operation will be aborted.",
     if tree_id == *target_commit.tree_id() {
         writeln!(ui.status(), "Nothing changed.")?;
     } else {
-        let new_commit = tx
-            .repo_mut()
+        tx.repo_mut()
             .rewrite_commit(&target_commit)
             .set_tree_id(tree_id)
             .write()?;
@@ -152,9 +151,6 @@ don't make any changes, then the operation will be aborted.",
             (tx.repo_mut().rebase_descendants()?, "")
         };
         if let Some(mut formatter) = ui.status_formatter() {
-            write!(formatter, "Created ")?;
-            tx.write_commit_summary(formatter.as_mut(), &new_commit)?;
-            writeln!(formatter)?;
             if num_rebased > 0 {
                 writeln!(
                     formatter,

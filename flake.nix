@@ -88,6 +88,7 @@
 
       env = {
         RUST_BACKTRACE = 1;
+        CARGO_INCREMENTAL = "0"; # https://github.com/rust-lang/rust/issues/139110
       };
     in {
       formatter = pkgs.alejandra;
@@ -107,6 +108,12 @@
             "^target/"
           ];
 
+          # Taplo requires SystemConfiguration access, as it unconditionally creates a
+          # reqwest client.
+          sandboxProfile = ''
+            (allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))
+          '';
+
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = nativeBuildInputs ++ [pkgs.installShellFiles];
           inherit buildInputs nativeCheckInputs;
@@ -116,7 +123,6 @@
             // {
               RUSTFLAGS = pkgs.lib.optionalString pkgs.stdenv.isLinux "-C link-arg=-fuse-ld=mold";
               NIX_JJ_GIT_HASH = self.rev or "";
-              CARGO_INCREMENTAL = "0";
             };
 
           postInstall = ''

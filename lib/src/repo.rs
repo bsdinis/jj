@@ -54,6 +54,7 @@ use crate::index::IndexReadError;
 use crate::index::IndexStore;
 use crate::index::MutableIndex;
 use crate::index::ReadonlyIndex;
+use crate::merge::trivial_merge;
 use crate::merge::MergeBuilder;
 use crate::object_id::HexPrefix;
 use crate::object_id::ObjectId as _;
@@ -78,11 +79,13 @@ use crate::ref_name::RemoteName;
 use crate::ref_name::RemoteRefSymbol;
 use crate::ref_name::WorkspaceName;
 use crate::ref_name::WorkspaceNameBuf;
+use crate::refs::diff_named_commit_ids;
 use crate::refs::diff_named_ref_targets;
 use crate::refs::diff_named_remote_refs;
 use crate::refs::merge_ref_targets;
 use crate::refs::merge_remote_refs;
 use crate::revset;
+use crate::revset::RevsetEvaluationError;
 use crate::revset::RevsetExpression;
 use crate::revset::RevsetIteratorExt as _;
 use crate::rewrite::merge_commit_trees;
@@ -100,6 +103,7 @@ use crate::simple_op_store::SimpleOpStore;
 use crate::store::Store;
 use crate::submodule_store::SubmoduleStore;
 use crate::transaction::Transaction;
+use crate::transaction::TransactionCommitError;
 use crate::view::RenameWorkspaceError;
 use crate::view::View;
 
@@ -626,6 +630,8 @@ pub enum RepoLoaderError {
     OpHeadsStoreError(#[from] OpHeadsStoreError),
     #[error(transparent)]
     OpStore(#[from] OpStoreError),
+    #[error(transparent)]
+    TransactionCommit(#[from] TransactionCommitError),
 }
 
 /// Helps create `ReadonlyRepoo` instances of a repo at the head operation or at
@@ -790,7 +796,7 @@ impl RepoLoader {
                 || format!("merge {num_operations} operations"),
                 |tx_description| tx_description.to_string(),
             );
-            let merged_repo = tx.write(tx_description).leave_unpublished();
+            let merged_repo = tx.write(tx_description)?.leave_unpublished();
             merged_repo.operation().clone()
         } else {
             base_op
@@ -1071,7 +1077,8 @@ impl MutableRepo {
         options: &RewriteRefsOptions,
     ) -> BackendResult<()> {
         self.update_all_references(options)?;
-        self.update_heads();
+        self.update_heads()
+            .map_err(|err| err.into_backend_error())?;
         Ok(())
     }
 
@@ -1152,22 +1159,25 @@ impl MutableRepo {
                 recreated_wc_commits.insert(old_commit_id, commit.clone());
                 commit
             };
-            self.edit(name, &new_wc_commit).unwrap();
+            self.edit(name, &new_wc_commit).map_err(|err| match err {
+                EditCommitError::BackendError(backend_error) => backend_error,
+                EditCommitError::WorkingCopyCommitNotFound(_)
+                | EditCommitError::RewriteRootCommit(_) => panic!("unexpected error: {err:?}"),
+            })?;
         }
         Ok(())
     }
 
-    fn update_heads(&mut self) {
+    fn update_heads(&mut self) -> Result<(), RevsetEvaluationError> {
         let old_commits_expression =
             RevsetExpression::commits(self.parent_mapping.keys().cloned().collect());
         let heads_to_add_expression = old_commits_expression
             .parents()
             .minus(&old_commits_expression);
-        let heads_to_add = heads_to_add_expression
-            .evaluate(self)
-            .unwrap()
+        let heads_to_add: Vec<_> = heads_to_add_expression
+            .evaluate(self)?
             .iter()
-            .map(Result::unwrap); // TODO: Return error to caller
+            .try_collect()?;
 
         let mut view = self.view().store_view().clone();
         for commit_id in self.parent_mapping.keys() {
@@ -1175,6 +1185,7 @@ impl MutableRepo {
         }
         view.head_ids.extend(heads_to_add);
         self.set_view(view);
+        Ok(())
     }
 
     /// Find descendants of `root`, unless they've already been rewritten
@@ -1186,13 +1197,12 @@ impl MutableRepo {
                 self.parent_mapping.keys().cloned().collect(),
             ))
             .evaluate(self)
-            .map_err(|err| err.expect_backend_error())?;
+            .map_err(|err| err.into_backend_error())?;
         let to_visit = to_visit_revset
             .iter()
             .commits(self.store())
             .try_collect()
-            // TODO: Return evaluation error to caller
-            .map_err(|err| err.expect_backend_error())?;
+            .map_err(|err| err.into_backend_error())?;
         Ok(to_visit)
     }
 
@@ -1409,6 +1419,34 @@ impl MutableRepo {
         Ok(())
     }
 
+    /// Merges working-copy commit. If there's a conflict, and if the workspace
+    /// isn't removed at either side, we keep the self side.
+    fn merge_wc_commit(
+        &mut self,
+        name: &WorkspaceName,
+        base_id: Option<&CommitId>,
+        other_id: Option<&CommitId>,
+    ) {
+        let view = self.view.get_mut();
+        let self_id = view.get_wc_commit_id(name);
+        // Not using merge_ref_targets(). Since the working-copy pointer moves
+        // towards random direction, it doesn't make sense to resolve conflict
+        // based on ancestry.
+        let new_id = if let Some(resolved) = trivial_merge(&[self_id, base_id, other_id]) {
+            resolved.cloned()
+        } else if self_id.is_none() || other_id.is_none() {
+            // We want to remove the workspace even if the self side changed the
+            // working-copy commit.
+            None
+        } else {
+            self_id.cloned()
+        };
+        match new_id {
+            Some(id) => view.set_wc_commit(name.to_owned(), id),
+            None => view.remove_wc_commit(name),
+        }
+    }
+
     pub fn rename_workspace(
         &mut self,
         old_name: &WorkspaceName,
@@ -1573,6 +1611,7 @@ impl MutableRepo {
             view.add_head(id);
         }
         view.set_local_bookmark_target(name, target);
+        self.view.mark_dirty();
     }
 
     pub fn merge_local_bookmark(
@@ -1708,33 +1747,11 @@ impl MutableRepo {
     }
 
     fn merge_view(&mut self, base: &View, other: &View) -> BackendResult<()> {
-        // TODO: Use `diff_named_commit_ids` to simplify this.
-        // Merge working-copy commits. If there's a conflict, we keep the self side.
-        for (name, base_wc_commit) in base.wc_commit_ids() {
-            let self_wc_commit = self.view().get_wc_commit_id(name);
-            let other_wc_commit = other.get_wc_commit_id(name);
-            if other_wc_commit == Some(base_wc_commit) || other_wc_commit == self_wc_commit {
-                // The other side didn't change or both sides changed in the
-                // same way.
-            } else if let Some(other_wc_commit) = other_wc_commit {
-                if self_wc_commit == Some(base_wc_commit) {
-                    self.view_mut()
-                        .set_wc_commit(name.clone(), other_wc_commit.clone());
-                }
-            } else {
-                // The other side removed the workspace. We want to remove it even if the self
-                // side changed the working-copy commit.
-                self.view_mut().remove_wc_commit(name);
-            }
+        let changed_wc_commits = diff_named_commit_ids(base.wc_commit_ids(), other.wc_commit_ids());
+        for (name, (base_id, other_id)) in changed_wc_commits {
+            self.merge_wc_commit(name, base_id, other_id);
         }
-        for (name, other_wc_commit) in other.wc_commit_ids() {
-            if self.view().get_wc_commit_id(name).is_none() && base.get_wc_commit_id(name).is_none()
-            {
-                // The other side added the workspace.
-                self.view_mut()
-                    .set_wc_commit(name.clone(), other_wc_commit.clone());
-            }
-        }
+
         let base_heads = base.heads().iter().cloned().collect_vec();
         let own_heads = self.view().heads().iter().cloned().collect_vec();
         let other_heads = other.heads().iter().cloned().collect_vec();
@@ -1801,10 +1818,10 @@ impl MutableRepo {
     ) -> BackendResult<()> {
         let mut removed_changes: HashMap<ChangeId, Vec<CommitId>> = HashMap::new();
         for item in revset::walk_revs(self, old_heads, new_heads)
-            .map_err(|err| err.expect_backend_error())?
+            .map_err(|err| err.into_backend_error())?
             .commit_change_ids()
         {
-            let (commit_id, change_id) = item.map_err(|err| err.expect_backend_error())?;
+            let (commit_id, change_id) = item.map_err(|err| err.into_backend_error())?;
             removed_changes
                 .entry(change_id)
                 .or_default()
@@ -1817,10 +1834,10 @@ impl MutableRepo {
         let mut rewritten_changes = HashSet::new();
         let mut rewritten_commits: HashMap<CommitId, Vec<CommitId>> = HashMap::new();
         for item in revset::walk_revs(self, new_heads, old_heads)
-            .map_err(|err| err.expect_backend_error())?
+            .map_err(|err| err.into_backend_error())?
             .commit_change_ids()
         {
-            let (commit_id, change_id) = item.map_err(|err| err.expect_backend_error())?;
+            let (commit_id, change_id) = item.map_err(|err| err.into_backend_error())?;
             if let Some(old_commits) = removed_changes.get(&change_id) {
                 for old_commit in old_commits {
                     rewritten_commits

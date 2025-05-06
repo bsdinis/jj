@@ -20,11 +20,13 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::hash::Hash;
 use std::iter::zip;
 use std::slice;
 use std::sync::Arc;
 
+use futures::future::try_join_all;
 use itertools::Itertools as _;
 use smallvec::smallvec_inline;
 use smallvec::SmallVec;
@@ -32,7 +34,6 @@ use smallvec::SmallVec;
 use crate::backend;
 use crate::backend::BackendResult;
 use crate::backend::FileId;
-use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::content_hash::ContentHash;
 use crate::content_hash::DigestUpdate;
@@ -89,7 +90,7 @@ where
         // TODO: Consider removing this special case, making the algorithm more strict,
         // and maybe add a more lenient version that is used when the user explicitly
         // asks for conflict resolution.
-        let ((value1, count1), (value2, count2)) = counts.into_iter().next_tuple().unwrap();
+        let [(value1, count1), (value2, count2)] = counts.into_iter().next_array().unwrap();
         assert_eq!(count1 + count2, 1);
         if count1 > 0 {
             Some(value1)
@@ -276,17 +277,18 @@ impl<T> Merge<T> {
 
     /// Simplify the merge by joining diffs like A->B and B->C into A->C.
     /// Also drops trivial diffs like A->A.
-    pub fn simplify(mut self) -> Self
+    #[must_use]
+    pub fn simplify(&self) -> Self
     where
         T: PartialEq + Clone,
     {
         let mapping = self.get_simplified_mapping();
         // Reorder values based on their new indices in the simplified merge.
-        self.values = mapping
+        let values = mapping
             .iter()
             .map(|index| self.values[*index].clone())
             .collect();
-        self
+        Merge { values }
     }
 
     /// Updates the merge based on the given simplified merge.
@@ -349,13 +351,6 @@ impl<T> Merge<T> {
     }
 
     /// Creates a new merge by applying `f` to each remove and add, returning
-    /// `None if `f` returns `None` for any of them.
-    pub fn maybe_map<'a, U>(&'a self, f: impl FnMut(&'a T) -> Option<U>) -> Option<Merge<U>> {
-        let values = self.values.iter().map(f).collect::<Option<_>>()?;
-        Some(Merge { values })
-    }
-
-    /// Creates a new merge by applying `f` to each remove and add, returning
     /// `Err if `f` returns `Err` for any of them.
     pub fn try_map<'a, U, E>(
         &'a self,
@@ -363,6 +358,22 @@ impl<T> Merge<T> {
     ) -> Result<Merge<U>, E> {
         let values = self.values.iter().map(f).try_collect()?;
         Ok(Merge { values })
+    }
+
+    /// Creates a new merge by applying the async function `f` to each remove
+    /// and add, running them concurrently, and returning `Err if `f`
+    /// returns `Err` for any of them.
+    pub async fn try_map_async<'a, F, U, E>(
+        &'a self,
+        f: impl FnMut(&'a T) -> F,
+    ) -> Result<Merge<U>, E>
+    where
+        F: Future<Output = Result<U, E>>,
+    {
+        let values = try_join_all(self.values.iter().map(f)).await?;
+        Ok(Merge {
+            values: values.into(),
+        })
     }
 }
 
@@ -563,46 +574,51 @@ where
     /// `Merge::with_new_file_ids()` to produce a new merge with the original
     /// executable bits preserved.
     pub fn to_file_merge(&self) -> Option<Merge<Option<FileId>>> {
-        self.maybe_map(|term| match borrow_tree_value(term.as_ref()) {
-            None => Some(None),
-            Some(TreeValue::File { id, executable: _ }) => Some(Some(id.clone())),
-            _ => None,
+        self.try_map(|term| match borrow_tree_value(term.as_ref()) {
+            None => Ok(None),
+            Some(TreeValue::File { id, executable: _ }) => Ok(Some(id.clone())),
+            _ => Err(()),
         })
+        .ok()
     }
 
     /// If this merge contains only files or absent entries, returns a merge of
     /// the files' executable bits.
-    pub fn to_executable_merge(&self) -> Option<Merge<bool>> {
-        self.maybe_map(|term| match borrow_tree_value(term.as_ref()) {
-            None => Some(false),
-            Some(TreeValue::File { id: _, executable }) => Some(*executable),
-            _ => None,
+    pub fn to_executable_merge(&self) -> Option<Merge<Option<bool>>> {
+        self.try_map(|term| match borrow_tree_value(term.as_ref()) {
+            None => Ok(None),
+            Some(TreeValue::File { id: _, executable }) => Ok(Some(*executable)),
+            _ => Err(()),
         })
+        .ok()
     }
 
     /// If every non-`None` term of a `MergedTreeValue`
     /// is a `TreeValue::Tree`, this converts it to
     /// a `Merge<Tree>`, with empty trees instead of
     /// any `None` terms. Otherwise, returns `None`.
-    pub fn to_tree_merge(
+    pub async fn to_tree_merge(
         &self,
         store: &Arc<Store>,
         dir: &RepoPath,
     ) -> BackendResult<Option<Merge<Tree>>> {
-        let tree_id_merge = self.maybe_map(|term| match borrow_tree_value(term.as_ref()) {
-            None => Some(None),
-            Some(TreeValue::Tree(id)) => Some(Some(id)),
-            Some(_) => None,
+        let tree_id_merge = self.try_map(|term| match borrow_tree_value(term.as_ref()) {
+            None => Ok(None),
+            Some(TreeValue::Tree(id)) => Ok(Some(id)),
+            Some(_) => Err(()),
         });
-        if let Some(tree_id_merge) = tree_id_merge {
-            let get_tree = |id: &Option<&TreeId>| -> BackendResult<Tree> {
-                if let Some(id) = id {
-                    store.get_tree(dir.to_owned(), id)
-                } else {
-                    Ok(Tree::empty(store.clone(), dir.to_owned()))
-                }
-            };
-            Ok(Some(tree_id_merge.try_map(get_tree)?))
+        if let Ok(tree_id_merge) = tree_id_merge {
+            Ok(Some(
+                tree_id_merge
+                    .try_map_async(|id| async move {
+                        if let Some(id) = id {
+                            store.get_tree_async(dir.to_owned(), id).await
+                        } else {
+                            Ok(Tree::empty(store.clone(), dir.to_owned()))
+                        }
+                    })
+                    .await?,
+            ))
         } else {
             Ok(None)
         }
@@ -610,23 +626,21 @@ where
 
     /// Creates a new merge with the file ids from the given merge. In other
     /// words, only the executable bits from `self` will be preserved.
+    ///
+    /// The given `file_ids` should have the same shape as `self`. Only the
+    /// `FileId` values may differ.
     pub fn with_new_file_ids(&self, file_ids: &Merge<Option<FileId>>) -> Merge<Option<TreeValue>> {
         assert_eq!(self.values.len(), file_ids.values.len());
-        let values = zip(self.iter(), file_ids.iter())
-            .map(|(tree_value, file_id)| {
-                if let Some(TreeValue::File { id: _, executable }) =
-                    borrow_tree_value(tree_value.as_ref())
-                {
-                    Some(TreeValue::File {
-                        id: file_id.as_ref().unwrap().clone(),
-                        executable: *executable,
-                    })
-                } else {
-                    assert!(tree_value.is_none());
-                    assert!(file_id.is_none());
-                    None
-                }
-            })
+        let values = zip(self.iter(), file_ids.iter().cloned())
+            .map(
+                |(tree_value, file_id)| match (borrow_tree_value(tree_value.as_ref()), file_id) {
+                    (Some(&TreeValue::File { id: _, executable }), Some(id)) => {
+                        Some(TreeValue::File { id, executable })
+                    }
+                    (None, None) => None,
+                    (old, new) => panic!("incompatible update: {old:?} to {new:?}"),
+                },
+            )
             .collect();
         Merge { values }
     }
@@ -1011,13 +1025,13 @@ mod tests {
             let merge = Merge::from_vec(terms.to_vec());
             // `simplify()` is idempotent
             assert_eq!(
-                merge.clone().simplify().simplify(),
-                merge.clone().simplify(),
+                merge.simplify().simplify(),
+                merge.simplify(),
                 "simplify() not idempotent for {merge:?}"
             );
             // `resolve_trivial()` is unaffected by `simplify()`
             assert_eq!(
-                merge.clone().simplify().resolve_trivial(),
+                merge.simplify().resolve_trivial(),
                 merge.resolve_trivial(),
                 "simplify() changed result of resolve_trivial() for {merge:?}"
             );
@@ -1115,24 +1129,6 @@ mod tests {
         assert_eq!(c(&[1]).map(increment), c(&[2]));
         // 3-way merge
         assert_eq!(c(&[1, 3, 5]).map(increment), c(&[2, 4, 6]));
-    }
-
-    #[test]
-    fn test_maybe_map() {
-        fn sqrt(i: &i32) -> Option<i32> {
-            if *i >= 0 {
-                Some((*i as f64).sqrt() as i32)
-            } else {
-                None
-            }
-        }
-        // 1-way merge
-        assert_eq!(c(&[1]).maybe_map(sqrt), Some(c(&[1])));
-        assert_eq!(c(&[-1]).maybe_map(sqrt), None);
-        // 3-way merge
-        assert_eq!(c(&[1, 4, 9]).maybe_map(sqrt), Some(c(&[1, 2, 3])));
-        assert_eq!(c(&[-1, 4, 9]).maybe_map(sqrt), None);
-        assert_eq!(c(&[1, -4, 9]).maybe_map(sqrt), None);
     }
 
     #[test]

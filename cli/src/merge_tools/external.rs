@@ -9,6 +9,7 @@ use std::sync::Arc;
 use bstr::BString;
 use itertools::Itertools as _;
 use jj_lib::backend::MergedTreeId;
+use jj_lib::backend::TreeValue;
 use jj_lib::conflicts;
 use jj_lib::conflicts::choose_materialized_conflict_marker_len;
 use jj_lib::conflicts::materialize_merge_result_to_bytes_with_marker_len;
@@ -183,9 +184,7 @@ fn run_mergetool_external_single_file(
     let MergeToolFile {
         repo_path,
         conflict,
-        file_merge,
-        simplified_file_content,
-        ..
+        file,
     } = merge_tool_file;
 
     let conflict_marker_style = editor
@@ -199,24 +198,24 @@ fn run_mergetool_external_single_file(
     // MIN_CONFLICT_MARKER_LEN since the merge tool can't know about our rules for
     // conflict marker length.
     let conflict_marker_len = if editor.merge_tool_edits_conflict_markers || uses_marker_length {
-        choose_materialized_conflict_marker_len(simplified_file_content)
+        choose_materialized_conflict_marker_len(&file.contents)
     } else {
         MIN_CONFLICT_MARKER_LEN
     };
     let initial_output_content = if editor.merge_tool_edits_conflict_markers {
         materialize_merge_result_to_bytes_with_marker_len(
-            simplified_file_content,
+            &file.contents,
             conflict_marker_style,
             conflict_marker_len,
         )
     } else {
         BString::default()
     };
-    assert_eq!(simplified_file_content.num_sides(), 2);
+    assert_eq!(file.contents.num_sides(), 2);
     let files: HashMap<&str, &[u8]> = maplit::hashmap! {
-        "base" => simplified_file_content.get_remove(0).unwrap().as_slice(),
-        "left" => simplified_file_content.get_add(0).unwrap().as_slice(),
-        "right" => simplified_file_content.get_add(1).unwrap().as_slice(),
+        "base" => file.contents.get_remove(0).unwrap().as_slice(),
+        "left" => file.contents.get_add(0).unwrap().as_slice(),
+        "right" => file.contents.get_add(1).unwrap().as_slice(),
         "output" => initial_output_content.as_slice(),
     };
 
@@ -286,7 +285,7 @@ fn run_mergetool_external_single_file(
             editor.merge_tool_edits_conflict_markers
         );
         conflicts::update_from_content(
-            file_merge,
+            &file.unsimplified_ids,
             store,
             repo_path,
             output_file_contents.as_slice(),
@@ -310,13 +309,15 @@ fn run_mergetool_external_single_file(
             ExternalToolError::InvalidConflictMarkers { exit_status },
         ));
     }
-    // Update the file ids only, leaving the executable flags unchanged
-    let new_file_ids = if let Some(resolved) = new_file_ids.as_resolved() {
-        Merge::from_vec(vec![resolved.clone(); conflict.as_slice().len()])
-    } else {
-        new_file_ids
+
+    let new_tree_value = match new_file_ids.into_resolved() {
+        Ok(file_id) => {
+            let executable = file.executable.expect("should have been resolved");
+            Merge::resolved(file_id.map(|id| TreeValue::File { id, executable }))
+        }
+        // Update the file ids only, leaving the executable flags unchanged
+        Err(file_ids) => conflict.with_new_file_ids(&file_ids),
     };
-    let new_tree_value = conflict.with_new_file_ids(&new_file_ids);
     tree_builder.set_or_remove(repo_path.to_owned(), new_tree_value);
     Ok(())
 }

@@ -178,7 +178,7 @@ The editor content of a commit description can be populated by the
 [templates]
 draft_commit_description = '''
 concat(
-  coalesce(description, "\n"),
+  coalesce(description, default_commit_description, "\n"),
   surround(
     "\nJJ: This commit contains the following changes:\n", "",
     indent("JJ:     ", diff.stat(72)),
@@ -189,12 +189,33 @@ concat(
 '''
 ```
 
-The value of the `ui.default-description` setting can also be used in order to
-fill in things like BUG=, TESTED= etc.
+You can override only the `default_commit_description` value if you like, e.g.:
+```toml
+[template-aliases]
+default_commit_description = '''
+"
+
+Closes #NNNN
+"
+'''
+```
+
+### Duplicate commit description
+
+By default, `jj duplicate` copies the descriptions from the original commits.
+You can customize this behavior by specifying the `duplicate_description`
+template, which is given a `Commit` type of the original commit.
 
 ```toml
-[ui]
-default-description = "\n\nTESTED=TODO"
+[templates]
+duplicate_description = '''
+concat(
+  description,
+  "\n(cherry picked from commit ",
+  commit_id,
+  ")"
+)
+'''
 ```
 
 ### Bookmark listing order
@@ -216,6 +237,30 @@ keys can be supplied here, the first key is the most significant.
 
 When the `--sort` option is used with `jj bookmark list`, the configuration
 is ignored.
+
+### Commit trailers
+
+You can configure automatic addition of trailers to commit descriptions using
+the `commit_trailers` template. Trailers defined in this template will only be
+added if they are not already present in the description.
+
+```toml
+[templates]
+commit_trailers = '''
+format_signed_off_by_trailer(self)
+++ if(!trailers.contains_key("Change-Id"), format_gerrit_change_id_trailer(self))'''
+```
+
+Some ready-to-use trailer templates are available for frequently used trailers:
+* `format_signed_off_by_trailer(commit)` creates a "Signed-off-by" trailer
+  using the committer info;
+* `format_gerrit_change_id_trailer(commit)` creates a "Change-Id" trailer
+  suitable to be used with Gerrit. It is based Jujutsu's change id.
+
+The `trailers.contains_key(key)` method can be used within the template to
+conditionally add a trailer if no other trailer with the same key exists.
+
+Existing trailers are also accessible via `commit.trailers()`.
 
 ### Diff colors and styles
 
@@ -724,6 +769,16 @@ interface = "full-screen-clear-output"
 interface = "quit-quickly-or-clear-output"
 ```
 
+#### Showing the ruler on startup
+
+```toml
+[ui.streampager]
+# Start with the ruler showing
+show-ruler = true # (default)
+# Start with the ruler hidden
+show-ruler = false
+```
+
 
 ### Processing contents to be paged
 
@@ -976,16 +1031,11 @@ obtained as follows:
 
 - **Windows:** Meld can be downloaded from <https://meldmerge.org/>.
 
-- **Mac OS:** Install Homebrew and run `brew install --cask dehesselle-meld`.
+- **Mac OS:** Install Homebrew and run `brew install --cask meld`.
   This will install both an app in `/Applications/Meld.app` and the command-line
   `meld` command that `jj` uses. You can read about [more details and other
   options](https://gist.github.com/ilyagr/1b40f6061d8ad320cee4c12843df1a23) but,
   as of this writing, this is by far the easiest.
-
-  !!! warning
-
-      Do *not* use the Homebrew `meld` package.
-      It does not work on ARM Macs and may have problems on recent versions of macOS.
 
 `jj` has two diff editing configurations that use Meld: `meld` for a 2-pane view
 and `meld-3` for a [three-pane view](#experimental-3-pane-diff-editing).
@@ -1283,7 +1333,30 @@ as follows:
 backends.ssh.allowed-signers = "/path/to/allowed-signers"
 ```
 
-### Sign commits only on `jj git push`
+### Manually signing commits
+
+You can use [`jj sign`](./cli-reference.md#jj-sign)/[`jj unsign`](./cli-reference.md#jj-unsign)
+to sign/unsign commits manually.
+
+!!! warning
+
+    `jj sign` always signs commits, even if they are already signed by the
+    user. While this is cumbersome for users signing via hardware devices, we
+    cannot reliably check if a commit is already signed without creating a
+    signature (see [this issue](https://github.com/jj-vcs/jj/issues/5786)).
+
+### Automatically signing commits
+
+The `signing.behavior` configuration option has four different options for what
+to do with signing commits on modification of a change (e.g., rebasing or edits).
+
+- `drop`: do not automatically sign; if a change was signed before
+  modification, drop that signing after modification.
+- `keep`: if a change was signed before modification, and it was authored by
+  you, attempt to sign it again after the modification.
+- `own`: sign all commits that were authored by you when you modify them.
+- `force`: sign all commits after modification, always, even if you are not the
+  author.
 
 Instead of signing all commits during creation when `signing.behavior` is
 set to `own`, the `git.sign-on-push` configuration can be used to sign
@@ -1303,23 +1376,11 @@ key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGj+J6N6SO+4P8dOZqfR1oiay2yxhhHnagH52
 sign-on-push = true
 ```
 
-### Manually signing commits
-
-You can use [`jj sign`](./cli-reference.md#jj-sign)/[`jj unsign`](./cli-reference.md#jj-unsign)
-to sign/unsign commits manually.
-
-
-!!! warning
-
-    `jj sign` is always signing commits, even if they are already signed by the
-    user. While this is cumbersome for users signing via hardware devices, we
-    cannot reliably check if a commit is already signed without creating a
-    signature (see [this issue](https://github.com/jj-vcs/jj/issues/5786)).
-
 ## Commit Signature Verification
 
 By default signature verification and display is **disabled** as it incurs a
-performance cost when rendering medium to large change logs.
+performance cost when rendering medium to large change logs. You can enable it
+by setting `ui.show-cryptographic-signatures` to true in your configuration.
 
 If you want to display commit signatures in your templates, you can use
 `commit.signature()` (see [Commit type](./templates.md#commit-type)). The
@@ -1534,11 +1595,15 @@ The files in the `conf.d` directory are loaded in lexicographic order. This allo
 configs to be split across multiple files and combines well
 with [Conditional Variables](#conditional-variables).
 
-| Platform | Location of `<PLATFORM_SPECIFIC>` dir | Example config file location                              |
-| :------- | :------------------------------------ | :-------------------------------------------------------- |
-| Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/jj/config.toml`                      |
-| macOS    | `$HOME/Library/Application Support`   | `/Users/Alice/Library/Application Support/jj/config.toml` |
-| Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Roaming\jj\config.toml`           |
+| Platform        | Location of `<PLATFORM_SPECIFIC>` dir | Example config file location                              |
+| :-------------- | :------------------------------------ | :-------------------------------------------------------- |
+| Linux and macOS | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/jj/config.toml`                      |
+| Windows         | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Roaming\jj\config.toml`           |
+
+On macOS, jj used to put the user config in `~/Library/Application Support`,
+and jj will still look there for backwards compatibility purposes; this is
+considered a deprecated location, and you should use the new default
+`XDG_CONFIG_HOME`.
 
 The location of the `jj` user config files/directories can also be overridden with the
 `JJ_CONFIG` environment variable. If it is not empty, it will be used instead

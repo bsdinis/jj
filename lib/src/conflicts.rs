@@ -25,7 +25,6 @@ use futures::stream::BoxStream;
 use futures::try_join;
 use futures::Stream;
 use futures::StreamExt as _;
-use futures::TryStreamExt as _;
 use itertools::Itertools as _;
 use pollster::FutureExt as _;
 
@@ -44,7 +43,6 @@ use crate::diff::DiffHunkKind;
 use crate::files;
 use crate::files::MergeResult;
 use crate::merge::Merge;
-use crate::merge::MergeBuilder;
 use crate::merge::MergedTreeValue;
 use crate::repo_path::RepoPath;
 use crate::store::Store;
@@ -122,11 +120,9 @@ pub async fn extract_as_single_hunk(
     store: &Store,
     path: &RepoPath,
 ) -> BackendResult<Merge<BString>> {
-    let builder: MergeBuilder<BString> = futures::stream::iter(merge.iter())
-        .then(|term| get_file_contents(store, path, term))
-        .try_collect()
-        .await?;
-    Ok(builder.build())
+    merge
+        .try_map_async(|term| get_file_contents(store, path, term))
+        .await
 }
 
 /// A type similar to `MergedTreeValue` but with associated data to include in
@@ -135,20 +131,9 @@ pub enum MaterializedTreeValue {
     Absent,
     AccessDenied(Box<dyn std::error::Error + Send + Sync>),
     File(MaterializedFileValue),
-    Symlink {
-        id: SymlinkId,
-        target: String,
-    },
-    FileConflict {
-        id: Merge<Option<FileId>>,
-        // TODO: or Vec<(FileId, Box<dyn Read>)> so that caller can stop reading
-        // when null bytes found?
-        contents: Merge<BString>,
-        executable: bool,
-    },
-    OtherConflict {
-        id: MergedTreeValue,
-    },
+    Symlink { id: SymlinkId, target: String },
+    FileConflict(MaterializedFileConflictValue),
+    OtherConflict { id: MergedTreeValue },
     GitSubmodule(CommitId),
     Tree(TreeId),
 }
@@ -184,6 +169,22 @@ impl MaterializedFileValue {
             })?;
         Ok(buf)
     }
+}
+
+/// Conflicted [`TreeValue::File`]s with file contents.
+pub struct MaterializedFileConflictValue {
+    /// File ids which preserve the shape of the tree conflict, to be used with
+    /// [`Merge::update_from_simplified()`].
+    pub unsimplified_ids: Merge<Option<FileId>>,
+    /// Simplified file ids, in which redundant id pairs are dropped.
+    pub ids: Merge<Option<FileId>>,
+    /// File contents corresponding to the simplified `ids`.
+    // TODO: or Vec<(FileId, Box<dyn Read>)> so that caller can stop reading
+    // when null bytes found?
+    pub contents: Merge<BString>,
+    /// Merged executable bit. `None` if there are changes in both executable
+    /// bit and file absence.
+    pub executable: Option<bool>,
 }
 
 /// Reads the data associated with a `MergedTreeValue` so it can be written to
@@ -225,23 +226,47 @@ async fn materialize_tree_value_no_access_denied(
         Ok(Some(TreeValue::Conflict(_))) => {
             panic!("cannot materialize legacy conflict object at path {path:?}");
         }
-        Err(conflict) => {
-            let Some(file_merge) = conflict.to_file_merge() else {
-                return Ok(MaterializedTreeValue::OtherConflict { id: conflict });
-            };
-            let file_merge = file_merge.simplify();
-            let contents = extract_as_single_hunk(&file_merge, store, path).await?;
-            let executable = if let Some(merge) = conflict.to_executable_merge() {
-                merge.resolve_trivial().copied().unwrap_or_default()
-            } else {
-                false
-            };
-            Ok(MaterializedTreeValue::FileConflict {
-                id: file_merge,
-                contents,
-                executable,
-            })
-        }
+        Err(conflict) => match try_materialize_file_conflict_value(store, path, &conflict).await? {
+            Some(file) => Ok(MaterializedTreeValue::FileConflict(file)),
+            None => Ok(MaterializedTreeValue::OtherConflict { id: conflict }),
+        },
+    }
+}
+
+/// Suppose `conflict` contains only files or absent entries, reads the file
+/// contents.
+pub async fn try_materialize_file_conflict_value(
+    store: &Store,
+    path: &RepoPath,
+    conflict: &MergedTreeValue,
+) -> BackendResult<Option<MaterializedFileConflictValue>> {
+    let (Some(unsimplified_ids), Some(executable_bits)) =
+        (conflict.to_file_merge(), conflict.to_executable_merge())
+    else {
+        return Ok(None);
+    };
+    let ids = unsimplified_ids.simplify();
+    let contents = extract_as_single_hunk(&ids, store, path).await?;
+    let executable = resolve_file_executable(&executable_bits);
+    Ok(Some(MaterializedFileConflictValue {
+        unsimplified_ids,
+        ids,
+        contents,
+        executable,
+    }))
+}
+
+/// Resolves conflicts in file executable bit, returns the original state if the
+/// file is deleted and executable bit is unchanged.
+pub fn resolve_file_executable(merge: &Merge<Option<bool>>) -> Option<bool> {
+    let resolved = merge.resolve_trivial().copied()?;
+    if resolved.is_some() {
+        resolved
+    } else {
+        // If the merge is resolved to None (absent), there should be the same
+        // number of Some(true) and Some(false). Pick the old state if
+        // unambiguous, so the new file inherits the original executable bit.
+        merge.removes().flatten().copied().all_equal_value().ok()
     }
 }
 
@@ -921,7 +946,7 @@ pub async fn update_from_content(
     conflict_marker_style: ConflictMarkerStyle,
     conflict_marker_len: usize,
 ) -> BackendResult<Merge<Option<FileId>>> {
-    let simplified_file_ids = file_ids.clone().simplify();
+    let simplified_file_ids = file_ids.simplify();
 
     // First check if the new content is unchanged compared to the old content. If
     // it is, we don't need parse the content or write any new objects to the
@@ -1015,4 +1040,56 @@ pub async fn update_from_content(
         Merge::from_vec(new_file_ids)
     };
     Ok(new_file_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_file_executable() {
+        fn resolve<const N: usize>(values: [Option<bool>; N]) -> Option<bool> {
+            resolve_file_executable(&Merge::from_vec(values.to_vec()))
+        }
+
+        // already resolved
+        assert_eq!(resolve([None]), None);
+        assert_eq!(resolve([Some(false)]), Some(false));
+        assert_eq!(resolve([Some(true)]), Some(true));
+
+        // trivially resolved
+        assert_eq!(resolve([Some(true), Some(true), Some(true)]), Some(true));
+        assert_eq!(resolve([Some(true), Some(false), Some(false)]), Some(true));
+        assert_eq!(resolve([Some(false), Some(true), Some(false)]), Some(false));
+        assert_eq!(resolve([None, None, Some(true)]), Some(true));
+
+        // unresolvable
+        assert_eq!(resolve([Some(false), Some(true), None]), None);
+
+        // trivially resolved to absent, so pick the original state
+        assert_eq!(resolve([Some(true), Some(true), None]), Some(true));
+        assert_eq!(resolve([None, Some(false), Some(false)]), Some(false));
+        assert_eq!(
+            resolve([None, None, Some(true), Some(true), None]),
+            Some(true)
+        );
+
+        // trivially resolved to absent, and the original state is ambiguous
+        assert_eq!(
+            resolve([Some(true), Some(true), None, Some(false), Some(false)]),
+            None
+        );
+        assert_eq!(
+            resolve([
+                None,
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ]),
+            None
+        );
+    }
 }

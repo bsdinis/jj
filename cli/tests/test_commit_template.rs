@@ -1655,3 +1655,76 @@ fn test_log_git_format_patch_template() {
     [EOF]
     ");
 }
+
+#[test]
+fn test_log_format_trailers() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    let output = work_dir.run_jj([
+        "log",
+        "--no-graph",
+        "-T",
+        "format_gerrit_change_id_trailer(self) ++ format_signed_off_by_trailer(self)",
+        "-r@",
+    ]);
+    insta::assert_snapshot!(output, @r"
+    Change-Id: I6a6a69649a45c67d3e96a7e5007c110ede34dec5
+    Signed-off-by: Test User <test.user@example.com>
+    [EOF]
+    ");
+
+    work_dir
+        .run_jj([
+            "describe",
+            "-r@",
+            "-m",
+            "a change with trailers",
+            r#"--config=templates.commit_trailers="format_signed_off_by_trailer(self) ++ format_gerrit_change_id_trailer(self)""#,
+        ])
+        .success();
+
+    let output = work_dir.run_jj(["log", "--no-graph", "-T", r#"trailers ++ "\n""#, "-r@"]);
+    insta::assert_snapshot!(output, @r"
+    Signed-off-by: Test User <test.user@example.com>
+    Change-Id: I6a6a69649a45c67d3e96a7e5007c110ede34dec5
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj([
+        "log",
+        "--no-graph",
+        "-T",
+        "trailers.map(|t| t.key())",
+        "-r@",
+    ]);
+    insta::assert_snapshot!(output, @"Signed-off-by Change-Id[EOF]");
+
+    let output = work_dir.run_jj([
+        "log",
+        "--no-graph",
+        "-T",
+        "trailers.map(|t| t.value())",
+        "-r@",
+    ]);
+    insta::assert_snapshot!(output, @"Test User <test.user@example.com> I6a6a69649a45c67d3e96a7e5007c110ede34dec5[EOF]");
+
+    let output = work_dir.run_jj([
+        "log",
+        "--no-graph",
+        "-T",
+        r#"self.trailers().contains_key("Signed-off-by")"#,
+        "-r@",
+    ]);
+    insta::assert_snapshot!(output, @"true[EOF]");
+
+    let output = work_dir.run_jj([
+        "log",
+        "--no-graph",
+        "-T",
+        r#"self.trailers().contains_key("foo")"#,
+        "-r@",
+    ]);
+    insta::assert_snapshot!(output, @"false[EOF]");
+}

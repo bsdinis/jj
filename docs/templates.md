@@ -109,6 +109,7 @@ No methods are defined. Can be constructed with `false` or `true` literal.
 This type cannot be printed. The following methods are defined.
 
 * `.description() -> String`
+* `.trailers() -> List<Trailer>`
 * `.change_id() -> ChangeId`
 * `.commit_id() -> CommitId`
 * `.parents() -> List<Commit>`
@@ -247,6 +248,13 @@ defined.
 * `.map(|item| expression) -> ListTemplate`: Apply template `expression`
   to each element. Example: `parents.map(|c| c.commit_id().short())`
 
+### List<Trailer> type
+
+The following methods are defined. See also the `List` type.
+
+* `.contains_key(key: Template) -> Boolean`: True if the commit description
+  contains at least one trailer with the key `key`.
+
 ### ListTemplate type
 
 The following methods are defined. See also the `List` type.
@@ -384,6 +392,13 @@ The following methods are defined.
 * `.start() -> Timestamp`
 * `.end() -> Timestamp`
 * `.duration() -> String`
+
+### Trailer type
+
+The following methods are defined.
+
+* `.key() -> String`
+* `.value() -> String`
 
 ### TreeDiff type
 

@@ -17,7 +17,7 @@ use std::io;
 use std::io::Read as _;
 use std::iter;
 
-use clap_complete::ArgValueCandidates;
+use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
 use jj_lib::backend::Signature;
 use jj_lib::commit::CommitIteratorExt as _;
@@ -29,10 +29,12 @@ use crate::cli_util::RevisionArg;
 use crate::command_error::user_error;
 use crate::command_error::CommandError;
 use crate::complete;
+use crate::description_util::add_trailers_with_template;
 use crate::description_util::description_template;
 use crate::description_util::edit_description;
 use crate::description_util::edit_multiple_descriptions;
 use crate::description_util::join_message_paragraphs;
+use crate::description_util::parse_trailers_template;
 use crate::description_util::ParsedBulkEditMessage;
 use crate::text_util::parse_author;
 use crate::ui::Ui;
@@ -47,14 +49,14 @@ pub(crate) struct DescribeArgs {
     /// The revision(s) whose description to edit (default: @)
     #[arg(
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable)
     )]
     revisions_pos: Vec<RevisionArg>,
     #[arg(
         short = 'r',
         hide = true,
         value_name = "REVSETS",
-        add = ArgValueCandidates::new(complete::mutable_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_mutable)
     )]
     revisions_opt: Vec<RevisionArg>,
     /// The change description to use (don't open editor)
@@ -140,7 +142,6 @@ pub(crate) fn cmd_describe(
         )
     };
 
-    let default_description_to_edit = tx.settings().get_string("ui.default-description")?;
     let shared_description = if args.stdin {
         let mut buffer = String::new();
         io::stdin().read_to_string(&mut buffer)?;
@@ -162,8 +163,6 @@ pub(crate) fn cmd_describe(
             let mut commit_builder = tx.repo_mut().rewrite_commit(commit).detach();
             if let Some(description) = &shared_description {
                 commit_builder.set_description(description);
-            } else if use_editor && commit_builder.description().is_empty() {
-                commit_builder.set_description(&default_description_to_edit);
             }
             if args.reset_author {
                 let new_author = commit_builder.committer().clone();
@@ -180,6 +179,20 @@ pub(crate) fn cmd_describe(
             commit_builder
         })
         .collect_vec();
+
+    if let Some(trailer_template) = parse_trailers_template(ui, &tx)? {
+        for commit_builder in &mut commit_builders {
+            // The first trailer would become the first line of the description.
+            // Also, a commit with no description is treated in a special way in jujutsu: it
+            // can be discarded as soon as it's no longer the working copy. Adding a
+            // trailer to an empty description would break that logic.
+            if use_editor || !commit_builder.description().is_empty() {
+                let temp_commit = commit_builder.write_hidden()?;
+                let new_description = add_trailers_with_template(&trailer_template, &temp_commit)?;
+                commit_builder.set_description(new_description);
+            }
+        }
+    }
 
     if use_editor {
         let temp_commits: Vec<_> = iter::zip(&commits, &commit_builders)

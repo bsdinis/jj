@@ -19,6 +19,7 @@ use indoc::indoc;
 use regex::Regex;
 
 use crate::common::fake_editor_path;
+use crate::common::force_interactive;
 use crate::common::to_toml_value;
 use crate::common::TestEnvironment;
 
@@ -230,6 +231,7 @@ fn test_config_list_layer() {
 
     let output = work_dir.run_jj(["config", "list", "--user"]);
     insta::assert_snapshot!(output, @r#"
+    "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json"
     test-key = "test-val"
     test-layered-key = "test-original-val"
     [EOF]
@@ -254,6 +256,7 @@ fn test_config_list_layer() {
 
     let output = work_dir.run_jj(["config", "list", "--repo"]);
     insta::assert_snapshot!(output, @r#"
+    "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json"
     test-layered-key = "test-layered-val"
     [EOF]
     "#);
@@ -303,6 +306,7 @@ fn test_config_list_origin() {
     ]);
     insta::assert_snapshot!(output, @r#"
     test-key = "test-val" # user $TEST_ENV/config/config.toml
+    "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json" # repo $TEST_ENV/repo/.jj/repo/config.toml
     test-layered-key = "test-layered-val" # repo $TEST_ENV/repo/.jj/repo/config.toml
     user.name = "Test User" # env
     user.email = "test.user@example.com" # env
@@ -596,6 +600,7 @@ fn test_config_set_for_user() {
     let user_config_toml = std::fs::read_to_string(&user_config_path)
         .unwrap_or_else(|_| panic!("Failed to read file {}", user_config_path.display()));
     insta::assert_snapshot!(user_config_toml, @r#"
+    "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json"
     test-key = "test-val"
 
     [test-table]
@@ -662,6 +667,7 @@ fn test_config_set_for_repo() {
     // Ensure test-key successfully written to user config.
     let repo_config_toml = work_dir.read_file(".jj/repo/config.toml");
     insta::assert_snapshot!(repo_config_toml, @r#"
+    "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json"
     test-key = "test-val"
 
     [test-table]
@@ -690,6 +696,8 @@ fn test_config_set_toml_types() {
     set_value("test-table.string", r#""foo""#);
     set_value("test-table.invalid", r"a + b");
     insta::assert_snapshot!(std::fs::read_to_string(&user_config_path).unwrap(), @r#"
+    "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json"
+
     [test-table]
     integer = 42
     float = 3.14
@@ -783,7 +791,10 @@ fn test_config_unset_inline_table_key() {
         .run_jj(["config", "unset", "--user", "inline-table.foo"])
         .success();
     let user_config_toml = std::fs::read_to_string(&user_config_path).unwrap();
-    insta::assert_snapshot!(user_config_toml, @"inline-table = {}");
+    insta::assert_snapshot!(user_config_toml, @r#"
+    "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json"
+    inline-table = {}
+    "#);
 }
 
 #[test]
@@ -855,7 +866,11 @@ fn test_config_unset_for_user() {
         .success();
 
     let user_config_toml = std::fs::read_to_string(&user_config_path).unwrap();
-    insta::assert_snapshot!(user_config_toml, @"[table]");
+    insta::assert_snapshot!(user_config_toml, @r#"
+    "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json"
+
+    [table]
+    "#);
 }
 
 #[test]
@@ -872,7 +887,7 @@ fn test_config_unset_for_repo() {
         .success();
 
     let repo_config_toml = work_dir.read_file(".jj/repo/config.toml");
-    insta::assert_snapshot!(repo_config_toml, @"");
+    insta::assert_snapshot!(repo_config_toml, @r#""$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json""#);
 }
 
 #[test]
@@ -948,6 +963,73 @@ fn test_config_edit_repo() {
         PathBuf::from(std::fs::read_to_string(test_env.env_root().join("path")).unwrap());
     assert_eq!(edited_path, dunce::simplified(&repo_config_path));
     assert!(repo_config_path.exists(), "new file should be created");
+}
+
+#[test]
+fn test_config_edit_invalid_config() {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_editor();
+
+    // Test re-edit
+    std::fs::write(
+        &edit_script,
+        "write\ninvalid config here\0next invocation\n\0write\ntest=\"success\"",
+    )
+    .unwrap();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    let output = work_dir.run_jj_with(|cmd| {
+        force_interactive(cmd)
+            .args(["config", "edit", "--repo"])
+            .write_stdin("Y\n")
+    });
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Warning: An error has been found inside the config:
+    Caused by:
+    1: Configuration cannot be parsed as TOML document
+    2: TOML parse error at line 1, column 9
+      |
+    1 | invalid config here
+      |         ^
+    expected `.`, `=`
+
+    Do you want to keep editing the file? If not, previous config will be restored. (Yn): [EOF]
+    ");
+
+    let output = work_dir.run_jj(["config", "get", "test"]);
+    insta::assert_snapshot!(output, @r"
+    success
+    [EOF]"
+    );
+
+    // Test the restore previous config
+    std::fs::write(&edit_script, "write\ninvalid config here").unwrap();
+    let work_dir = test_env.work_dir("repo");
+    let output = work_dir.run_jj_with(|cmd| {
+        force_interactive(cmd)
+            .args(["config", "edit", "--repo"])
+            .write_stdin("n\n")
+    });
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Warning: An error has been found inside the config:
+    Caused by:
+    1: Configuration cannot be parsed as TOML document
+    2: TOML parse error at line 1, column 9
+      |
+    1 | invalid config here
+      |         ^
+    expected `.`, `=`
+
+    Do you want to keep editing the file? If not, previous config will be restored. (Yn): [EOF]
+    ");
+
+    let output = work_dir.run_jj(["config", "get", "test"]);
+    insta::assert_snapshot!(output, @r"
+    success
+    [EOF]"
+    );
 }
 
 #[test]

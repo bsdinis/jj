@@ -14,8 +14,8 @@
 
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
-use jj_lib::annotate::get_annotation_for_file;
 use jj_lib::annotate::FileAnnotation;
+use jj_lib::annotate::FileAnnotator;
 use jj_lib::repo::Repo;
 use jj_lib::revset::RevsetExpression;
 use tracing::instrument;
@@ -25,7 +25,7 @@ use crate::cli_util::RevisionArg;
 use crate::command_error::user_error;
 use crate::command_error::CommandError;
 use crate::commit_templater::AnnotationLine;
-use crate::commit_templater::CommitTemplateLanguage;
+use crate::commit_templater::CommitTemplatePropertyKind;
 use crate::complete;
 use crate::templater::TemplateRenderer;
 use crate::ui::Ui;
@@ -47,7 +47,7 @@ pub(crate) struct FileAnnotateArgs {
         long,
         short,
         value_name = "REVSET",
-        add = ArgValueCandidates::new(complete::all_revisions)
+        add = ArgValueCompleter::new(complete::revset_expression_all),
     )]
     revision: Option<RevisionArg>,
     /// Render each line using the given template
@@ -101,15 +101,16 @@ pub(crate) fn cmd_file_annotate(
         ui,
         &language,
         &template_text,
-        CommitTemplateLanguage::wrap_annotation_line,
+        CommitTemplatePropertyKind::wrap_annotation_line,
     )?;
 
     // TODO: Should we add an option to limit the domain to e.g. recent commits?
     // Note that this is probably different from "--skip REVS", which won't
     // exclude the revisions, but will ignore diffs in those revisions as if
     // ancestor revisions had new content.
-    let domain = RevsetExpression::all();
-    let annotation = get_annotation_for_file(repo.as_ref(), &starting_commit, &domain, &file_path)?;
+    let mut annotator = FileAnnotator::from_commit(&starting_commit, &file_path)?;
+    annotator.compute(repo.as_ref(), &RevsetExpression::all())?;
+    let annotation = annotator.to_annotation();
 
     render_file_annotation(repo.as_ref(), ui, &template, &annotation)?;
     Ok(())

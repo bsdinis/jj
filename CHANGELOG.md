@@ -10,6 +10,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Release highlights
 
+* Experimental support for transferring the change ID to/from Git remotes behind configuration
+  setting `git.write-change-id-header`. If this is enabled, the change ID will be stored in the Git
+  commit itself (in a commit header called `change-id`), which means it will be transferred by
+  regular `git push` etc. This is an evolving feature that currently defaults to "false". This
+  default will likely change in the future as we gain confidence with forge support and user
+  expectations.
+
 ### Breaking changes
 
 * The old `libgit2` code path for fetches and pushes has been removed,
@@ -19,17 +26,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Zlib, OpenSSL, and `pkg-config`, and ensure they are not setting the
   Cargo `git2` or `vendored-openssl` features.
 
-### Deprecations
+* `jj git push -c`/`--change` no longer moves existing local bookmarks.
 
-### New features
-
-### Fixed bugs
-
-## [Unreleased]
-
-### Release highlights
-
-### Breaking changes
+* The `editor-*.jjdescription` files passed to your editor by e.g. `jj describe`
+  are now written to your system's temporary directory instead of `.jj/repo/`.
 
 ### Deprecations
 
@@ -37,6 +37,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   code path for fetches and pushes will be removed entirely in 0.30.
   Please report any remaining issues you have with the Git
   subprocessing path.
+
+* `ui.default-description` has been deprecated, and will be migrated to
+  `template-aliases.default_commit_description`. Please also consider using
+  [`templates.draft_commit_description`](docs/config.md#default-description),
+  and/or [`templates.commit_trailers`](docs/config.md#commit-trailers).
+
+* On macOS, config.toml files in `~/Library/Application Support/jj` are
+  deprecated; one should instead use `$XDG_CONFIG_HOME/jj`
+  (defaults to `~/.config/jj`)
 
 ### New features
 
@@ -48,7 +57,45 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Added `ui.bookmark-list-sort-keys` setting to configure default sort keys for the
   `jj bookmark list` command.
 
+* New `signed` revset function to filter for cryptographically signed commits.
+
+* `jj describe`, `jj commit`, `jj new`, `jj squash` and `jj split` add the
+  commit trailers, configured in the `commit_trailers` template, to the commit
+  description. Use cases include DCO Sign Off and Gerrit Change Id.
+
+* Added `duplicate_description` template, which allows [customizing the descriptions
+  of the commits `jj duplicate` creates](docs/config.md#duplicate-commit-description).
+
+* `jj absorb` can now squash a deleted file if it was added by one of the
+  destination revisions.
+
+* Added `ui.streampager.show-ruler` setting to configure whether the ruler should be
+  shown when the builtin pager starts up.
+
+* `jj git fetch` now warns instead of erroring for unknown `git.fetch` remotes
+  if other remotes are available.
+
+* Commit objects in templates now have `trailers() -> List<Trailer>`, the Trailer
+  objects have `key() -> String` and `value() -> String`.
+
+* `jj config edit` will now roll back to previous version if a syntax error has been introduced in the new config.
+
+* When using dynamic command-line completion, revision names will be completed
+  in more complex expressions. For example, typing
+  `jj log -r first-bookmark..sec` and then pressing Tab could complete the
+  expression to `first-bookmark..second-bookmark`.
+
+
 ### Fixed bugs
+
+* Fixed crash on change-delete conflict resolution.
+  [#6250](https://github.com/jj-vcs/jj/issues/6250)
+
+* The builtin diff editor now tries to preserve unresolved conflicts.
+  [#4963](https://github.com/jj-vcs/jj/issues/4963)
+
+* Fixed bash and zsh shell completion when completing aliases of multiple arguments.
+  [#5377](https://github.com/jj-vcs/jj/issues/5377)
 
 ### Packaging changes
 
